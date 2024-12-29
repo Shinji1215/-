@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>今日の占い</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      padding: 20px;
+    }
+    h1 {
+      color: #4CAF50;
+    }
+    form {
+      margin: 20px 0;
+    }
+    input, select, button {
+      margin: 5px;
+      padding: 10px;
+      font-size: 16px;
+    }
+  </style>
+</head>
+<body>
+  <h1>今日の占い</h1>
+  <p>生年月日と性別を入力してください。</p>
+  <form id="fortuneForm">
+    <input type="date" id="birthdate" required>
+    <select id="gender">
+      <option value="male">男性</option>
+      <option value="female">女性</option>
+    </select>
+    <button type="submit">占う</button>
+  </form>
+  <h2 id="result"></h2>
+
+  <script>
+    document.getElementById('fortuneForm').addEventListener('submit', function(e) {
+      e.preventDefault();
+      const fortunes = [
+        "今日は最高の日です！",
+        "新しい挑戦をすると良い結果が得られそう。",
+        "慎重な行動が吉。",
+        "友人との時間を大切にしましょう。",
+        "リラックスする時間を作ると良い日です。"
+      ];
+      const randomFortune = fortunes[Math.floor(Math.random() * fortunes.length)];
+      document.getElementById('result').innerText = randomFortune;
+    });
+  </script>
+</body>
+</html>
