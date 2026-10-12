@@ -285,10 +285,11 @@ qStrongBuy  = false
 qStrongSell = false
 
 qFinish(string msg) =>
-    line.set_x2(lnE, bar_index)
-    line.set_x2(lnS, bar_index)
-    line.set_x2(lnT1, bar_index)
-    line.set_x2(lnT2, bar_index)
+    if not na(lnE)
+        line.set_x2(lnE, bar_index)
+        line.set_x2(lnS, bar_index)
+        line.set_x2(lnT1, bar_index)
+        line.set_x2(lnT2, bar_index)
     msg
 
 if barstate.isconfirmed and (buySignal or sellSignal) and not (buySignal and sellSignal)
@@ -373,6 +374,14 @@ if barstate.isconfirmed and (buySignal or sellSignal) and not (buySignal and sel
         tWarned := false
         tGrade := g + " " + word
         tStatus := "保有中の想定"
+        lnE := na
+        lnS := na
+        lnT1 := na
+        lnT2 := na
+        lbE := na
+        lbS := na
+        lbT1 := na
+        lbT2 := na
         if pShowPlan
             int x2 = bar_index + 20
             lnE  := line.new(bar_index, entry, x2, entry, color=color.new(color.white, 0), width=2)
@@ -406,10 +415,11 @@ else if barstate.isconfirmed and tDir != 0 and bar_index > tBar  // 入った後
             tTp1Hit := true
             tSL := tEntry
             tStatus := "利確1到達（損切りを建値へ）"
-            line.set_y1(lnS, tEntry)
-            line.set_y2(lnS, tEntry)
-            label.set_y(lbS, tEntry)
-            label.set_text(lbS, "損切り → 建値 " + qFmtP(tEntry))
+            if not na(lnS)
+                line.set_y1(lnS, tEntry)
+                line.set_y2(lnS, tEntry)
+                label.set_y(lbS, tEntry)
+                label.set_text(lbS, "損切り → 建値 " + qFmtP(tEntry))
             label.new(bar_index, yPos, "✅ 利確1到達\n損切りを建値へ", yloc=tDir == 1 ? yloc.abovebar : yloc.belowbar, style=tDir == 1 ? label.style_label_down : label.style_label_up, color=color.new(color.lime, 40), textcolor=color.black, size=size.small)
             alert(syminfo.ticker + " 5分足：利確1到達。損切りを建値へ。", alert.freq_once_per_bar_close)
         // 騙し警告：利確1の前に、ブレイクしたラインの内側で足が確定した（ルール：ライン内側で確定したら撤退）
