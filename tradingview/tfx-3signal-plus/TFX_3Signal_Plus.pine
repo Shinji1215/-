@@ -1,0 +1,442 @@
+//@version=5
+indicator("Traders S.S 3 )", shorttitle="3根拠システム", overlay=true, max_labels_count=500, max_lines_count=50)
+
+// ============================================================
+// このインジケーターは Traders FX の手法
+// 「サポート/レジスタンスのブレイク(流動性狩り) → EMA8/50クロス → 反対側のライン
+//  ブレイク(BOS) が順番に揃ったらエントリー検討」を自動検出します。
+//
+// 注意点(正直な前提として):
+// ・サポレジは自動でスイング高値/安値(ピボット)から引いています。
+//   手動で引いているラインとは完全には一致しません。目安として使い、
+//   実際のラインと比較・微調整してください。
+// ・ピボットの性質上、確定には右側 pivotRight 本のバックテスト用の
+//   確定待ちが発生します(リアルタイムでは少し遅れて確定します)。
+// ・5分足での運用を想定したデフォルト値にしています。1時間足で使う
+//   場合はピボット本数・有効期限を調整してください。
+// ============================================================
+
+// ==================== EMA設定 ====================
+emaFastLen = input.int(8, "EMA短期(本数)", minval=1, group="EMA設定")
+emaSlowLen = input.int(50, "EMA長期(本数)", minval=1, group="EMA設定")
+
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+plot(emaFast, title="EMA8", color=color.new(color.blue, 0), linewidth=1)
+plot(emaSlow, title="EMA50", color=color.new(color.orange, 0), linewidth=2)
+
+bullCross = ta.crossover(emaFast, emaSlow)
+bearCross = ta.crossunder(emaFast, emaSlow)
+
+if bullCross
+    label.new(bar_index, low, "EMAクロス\n買いの可能性あり", style=label.style_label_up, color=color.new(color.green, 70), textcolor=color.green, size=size.small, yloc=yloc.belowbar)
+if bearCross
+    label.new(bar_index, high, "EMAクロス\n売りの可能性あり", style=label.style_label_down, color=color.new(color.red, 70), textcolor=color.red, size=size.small, yloc=yloc.abovebar)
+
+// ==================== 自動サポート/レジスタンス(スイング高安) ====================
+pivotLeft  = input.int(5, "スイング判定: 左側バー数", minval=1, group="サポレジ設定")
+pivotRight = input.int(5, "スイング判定: 右側バー数(確定待ち)", minval=1, group="サポレジ設定")
+
+swingHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+swingLow  = ta.pivotlow(low, pivotLeft, pivotRight)
+
+var float resistanceLevel = na
+var float supportLevel = na
+var line resistanceLine = na
+var line supportLine = na
+
+if not na(swingHigh)
+    resistanceLevel := swingHigh
+    line.delete(resistanceLine)
+    resistanceLine := line.new(bar_index[pivotRight], swingHigh, bar_index, swingHigh, color=color.new(color.red, 30), width=1, extend=extend.right)
+if not na(swingLow)
+    supportLevel := swingLow
+    line.delete(supportLine)
+    supportLine := line.new(bar_index[pivotRight], swingLow, bar_index, swingLow, color=color.new(color.blue, 30), width=1, extend=extend.right)
+
+supportBreakDown   = not na(supportLevel) and ta.crossunder(close, supportLevel)
+resistanceBreakUp  = not na(resistanceLevel) and ta.crossover(close, resistanceLevel)
+
+// ==================== 3根拠シーケンス(流動性狩り→EMAクロス→BOS) ====================
+maxBarsValid = input.int(30, "根拠の有効期限(本数)", minval=1, group="3根拠設定")
+
+var bool buyGrabActive = false
+var int  buyGrabBar = na
+var bool buyEmaActive = false
+
+var bool sellGrabActive = false
+var int  sellGrabBar = na
+var bool sellEmaActive = false
+
+// 期限切れリセット
+if buyGrabActive and (bar_index - buyGrabBar > maxBarsValid)
+    buyGrabActive := false
+    buyEmaActive := false
+if sellGrabActive and (bar_index - sellGrabBar > maxBarsValid)
+    sellGrabActive := false
+    sellEmaActive := false
+
+// --- 買いシーケンス: サポートブレイク(流動性狩り) → EMA上クロス → レジスタンスブレイク(BOS) ---
+if supportBreakDown
+    buyGrabActive := true
+    buyGrabBar := bar_index
+    buyEmaActive := false
+
+if buyGrabActive and bullCross
+    buyEmaActive := true
+
+buySignal = buyGrabActive and buyEmaActive and resistanceBreakUp
+
+if buySignal
+    buyGrabActive := false
+    buyEmaActive := false
+
+// --- 売りシーケンス: レジスタンスブレイク(流動性狩り) → EMA下クロス → サポートブレイク(BOS) ---
+if resistanceBreakUp
+    sellGrabActive := true
+    sellGrabBar := bar_index
+    sellEmaActive := false
+
+if sellGrabActive and bearCross
+    sellEmaActive := true
+
+sellSignal = sellGrabActive and sellEmaActive and supportBreakDown
+
+if sellSignal
+    sellGrabActive := false
+    sellEmaActive := false
+
+if buySignal
+    label.new(bar_index, low, "🎯 3根拠成立\n買いエントリー検討", style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.black, size=size.normal, yloc=yloc.belowbar)
+if sellSignal
+    label.new(bar_index, high, "🎯 3根拠成立\n売りエントリー検討", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.normal, yloc=yloc.abovebar)
+
+alertcondition(buySignal, title="3根拠成立(買い)", message="XAUUSD: サポートブレイク→EMA上クロス→レジスタンスブレイク(BOS)が揃いました。買いエントリー検討。")
+alertcondition(sellSignal, title="3根拠成立(売り)", message="XAUUSD: レジスタンスブレイク→EMA下クロス→サポートブレイク(BOS)が揃いました。売りエントリー検討。")
+
+// ==================== 長いヒゲ(補助シグナル・単独) ====================
+// こちらは3根拠とは別に、「長いヒゲが出た」ことだけを知らせる単純な補助シグナルです。
+wickBodyMult = input.float(2.0, "ヒゲが実体の何倍で「長い」とするか", minval=0.5, step=0.1, group="長いヒゲ設定(補助)")
+wickAtrMult  = input.float(0.5, "ヒゲがATRの何倍以上で「長い」とするか", minval=0.1, step=0.1, group="長いヒゲ設定(補助)")
+atrLen       = input.int(14, "ATR期間", minval=1, group="長いヒゲ設定(補助)")
+
+atrVal = ta.atr(atrLen)
+body = math.abs(close - open)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+isLongUpperWick = upperWick > body * wickBodyMult and upperWick > atrVal * wickAtrMult
+isLongLowerWick = lowerWick > body * wickBodyMult and lowerWick > atrVal * wickAtrMult
+
+plotshape(isLongUpperWick, title="長い上ヒゲ", style=shape.triangledown, location=location.abovebar, color=color.new(color.purple, 0), size=size.tiny, text="上ヒゲ")
+plotshape(isLongLowerWick, title="長い下ヒゲ", style=shape.triangleup, location=location.belowbar, color=color.new(color.teal, 0), size=size.tiny, text="下ヒゲ")
+
+alertcondition(isLongUpperWick, title="長い上ヒゲ検出(補助)", message="XAUUSD: 長い上ヒゲを検出しました。")
+alertcondition(isLongLowerWick, title="長い下ヒゲ検出(補助)", message="XAUUSD: 長い下ヒゲを検出しました。")
+
+// ============================================================
+// ▼▼▼ ここから下は追加分（上の元のコードは1文字も変更していません） ▼▼▼
+// ・3根拠成立の足に「エントリー強さ ◎○✕」を表示
+// ・エントリー／損切り／利確1／利確2 のラインを自動で引く
+// ・入った後の「騙し警告」と「結果（利確到達・損切り・建値終了）」を表示
+// ・判定はすべて足の確定後。上位足は確定済みの値のみ使用（後から書き換わらない）
+// ・◎○✕は5項目のチェックが揃った数で、勝率ではありません。しきい値は検証用の初期値です
+// ============================================================
+
+// ==================== 追加：設定 ====================
+grpQ = "追加① エントリー強さ"
+qShowGrade   = input.bool(true, "エントリー強さ（◎○✕）を表示", group=grpQ)
+qNearTol     = input.float(0.2, "重要ラインの狩りとみなす近さ（ATR×）", minval=0, step=0.05, group=grpQ)
+qStrongBody  = input.float(0.8, "強い抜け：BOS足の実体 ≧ ATR×", minval=0.1, step=0.1, group=grpQ)
+qHtfTf       = input.timeframe("60", "目線を見る時間足", group=grpQ)
+qMinRoom     = input.float(30, "次のラインまでの最低余地（pips）", minval=0, group=grpQ)
+qPipOverride = input.float(0.0, "1pipの値幅（0＝自動：XAU 0.1／その他 1.0）", minval=0, group=grpQ)
+
+grpP = "追加② エントリー・損切り・利確"
+pShowPlan  = input.bool(true, "エントリー・損切り・利確ラインを表示", group=grpP)
+pSlBuf     = input.float(0.1, "損切り：狩りの先端からのバッファ（ATR×）", minval=0, step=0.05, group=grpP)
+pTp1R      = input.float(1.0, "利確1：損切り幅の何倍（R）", minval=0.1, step=0.1, group=grpP)
+pTp2MinR   = input.float(1.5, "利確2：重要ラインを使う最低R", minval=0.5, step=0.1, group=grpP)
+pTp2DefR   = input.float(2.0, "利確2：重要ラインがない時のR", minval=0.5, step=0.1, group=grpP)
+pMaxHold   = input.int(48, "結果を追う最大本数（48本＝4時間）", minval=1, group=grpP)
+pShowTable = input.bool(false, "右下に計画の表を表示", group=grpP)
+
+grpT = "追加③ 時間帯（日本時間の夏冬は自動）"
+qAsiaSess = input.session("0700-1500", "アジア時間（日本時間）", group=grpT)
+qAsiaAM   = input.session("0700-1200", "アジア前場（12時に一度ライン確定）", group=grpT)
+qLonSess  = input.session("0800-1200", "ロンドン高安を取る時間（ロンドン現地）", group=grpT)
+qWAsia    = input.session("1200-1500", "トレード時間：アジア後半（日本時間）", group=grpT)
+qWPre     = input.session("0700-0800", "トレード時間：プリロンドン（ロンドン現地）", group=grpT)
+qWLon     = input.session("0800-1100", "トレード時間：ロンドン（ロンドン現地）", group=grpT)
+qWNY      = input.session("0800-1130", "トレード時間：NY（NY現地）", group=grpT)
+qWNYSE    = input.session("0930-1130", "うちNYSE（NY現地）", group=grpT)
+
+// ==================== 追加：基本データ ====================
+qIsXAU  = str.contains(syminfo.ticker, "XAU")
+qPip    = qPipOverride > 0 ? qPipOverride : qIsXAU ? 0.1 : 1.0
+qUnit   = qIsXAU or qPipOverride > 0 ? "pips" : "pt"
+qBodyAtr = nz(atrVal[1]) > 0 ? body / atrVal[1] : na
+
+qPdh   = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+qPdl   = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+qHFast = request.security(syminfo.tickerid, qHtfTf, ta.ema(close, 8)[1], lookahead=barmerge.lookahead_on)
+qHSlow = request.security(syminfo.tickerid, qHtfTf, ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+qHtfBias = na(qHFast) or na(qHSlow) ? 0 : qHFast > qHSlow ? 1 : qHFast < qHSlow ? -1 : 0
+
+qInAsia   = not na(time(timeframe.period, qAsiaSess, "Asia/Tokyo"))
+qInAsiaAM = not na(time(timeframe.period, qAsiaAM, "Asia/Tokyo"))
+qInLon    = not na(time(timeframe.period, qLonSess, "Europe/London"))
+qTA = not na(time(timeframe.period, qWAsia, "Asia/Tokyo"))
+qTP = not na(time(timeframe.period, qWPre, "Europe/London"))
+qTL = not na(time(timeframe.period, qWLon, "Europe/London"))
+qTN = not na(time(timeframe.period, qWNY, "America/New_York"))
+qTS = not na(time(timeframe.period, qWNYSE, "America/New_York"))
+qInWin = qTA or qTP or qTL or qTN
+qWinNm = qTN ? (qTS ? "NYSE" : "NY") : qTL ? "ロンドン" : qTP ? "プリロンドン" : qTA ? "アジア後半" : "時間外"
+
+// アジア・ロンドンの高安（セッション終了時に確定。アジアは12時にも一度確定）
+var float qAH = na
+var float qAL = na
+var float qLH = na
+var float qLL = na
+var float qAsiaH = na
+var float qAsiaL = na
+var float qLonH  = na
+var float qLonL  = na
+if (not qInAsiaAM and qInAsiaAM[1]) or (not qInAsia and qInAsia[1])
+    qAsiaH := qAH
+    qAsiaL := qAL
+if not qInLon and qInLon[1]
+    qLonH := qLH
+    qLonL := qLL
+if qInAsia and not qInAsia[1]
+    qAH := high
+    qAL := low
+else if qInAsia
+    qAH := math.max(qAH, high)
+    qAL := math.min(qAL, low)
+if qInLon and not qInLon[1]
+    qLH := high
+    qLL := low
+else if qInLon
+    qLH := math.max(qLH, high)
+    qLL := math.min(qLL, low)
+
+// 狩りの先端（狩りの足からシグナル足までの最安値／最高値）
+qBuyLen  = na(buyGrabBar)  ? 1 : math.min(math.max(bar_index - buyGrabBar + 1, 1), 500)
+qSellLen = na(sellGrabBar) ? 1 : math.min(math.max(bar_index - sellGrabBar + 1, 1), 500)
+qBuyExt  = ta.lowest(low, qBuyLen)
+qSellExt = ta.highest(high, qSellLen)
+
+// ==================== 追加：判定用の関数 ====================
+// 狩りの先端が重要ラインを狩って戻っているか（買い＝安値側／売り＝高値側）。該当ライン名を返す
+qSweptName(int dir, float ext) =>
+    float tol = nz(atrVal) * qNearTol
+    string nm = ""
+    if dir == 1
+        nm := not na(qPdl) and ext <= qPdl + tol and close > qPdl ? "前日安値" : not na(qAsiaL) and ext <= qAsiaL + tol and close > qAsiaL ? "アジア安値" : not na(qLonL) and ext <= qLonL + tol and close > qLonL ? "ロンドン安値" : ""
+    else
+        nm := not na(qPdh) and ext >= qPdh - tol and close < qPdh ? "前日高値" : not na(qAsiaH) and ext >= qAsiaH - tol and close < qAsiaH ? "アジア高値" : not na(qLonH) and ext >= qLonH - tol and close < qLonH ? "ロンドン高値" : ""
+    nm
+
+// price から dir 方向で、距離が minDist 以上ある一番近い重要ライン [価格, 名前]
+qNextLevel(int dir, float price, float minDist) =>
+    float[] ps = array.from(qPdh, qPdl, qAsiaH, qAsiaL, qLonH, qLonL)
+    string[] ns = array.from("前日高値", "前日安値", "アジア高値", "アジア安値", "ロンドン高値", "ロンドン安値")
+    float bestP = na
+    string bestN = ""
+    for i = 0 to 5
+        float p = array.get(ps, i)
+        if not na(p)
+            float d = (p - price) * dir
+            if d > minDist and (na(bestP) or d < (bestP - price) * dir)
+                bestP := p
+                bestN := array.get(ns, i)
+    [bestP, bestN]
+
+qFmtP(float p) =>
+    str.tostring(p, format.mintick)
+qFmtPips(float d) =>
+    (d >= 0 ? "+" : "") + str.tostring(d / qPip, "#") + qUnit
+
+// ==================== 追加：3根拠成立時の強さ判定と計画 ====================
+var int   tDir    = 0
+var int   tBar    = na
+var float tEntry  = na
+var float tSL     = na
+var float tTP1    = na
+var float tTP2    = na
+var float tLevel  = na
+var bool  tTp1Hit = false
+var bool  tWarned = false
+var string tGrade  = ""
+var string tStatus = "まだサインなし"
+var line  lnE  = na
+var line  lnS  = na
+var line  lnT1 = na
+var line  lnT2 = na
+var label lbE  = na
+var label lbS  = na
+var label lbT1 = na
+var label lbT2 = na
+
+qStrongBuy  = false
+qStrongSell = false
+
+qFinish(string msg) =>
+    line.set_x2(lnE, bar_index)
+    line.set_x2(lnS, bar_index)
+    line.set_x2(lnT1, bar_index)
+    line.set_x2(lnT2, bar_index)
+    msg
+
+if barstate.isconfirmed and (buySignal or sellSignal) and not (buySignal and sellSignal)
+    int   d     = buySignal ? 1 : -1
+    float ext   = d == 1 ? qBuyExt : qSellExt
+    // ブレイクしたライン（BOSのライン）：買いはレジスタンス、売りはサポート
+    float brk   = d == 1 ? resistanceLevel : supportLevel
+    string swept = qSweptName(d, ext)
+    bool  fvg   = d == 1 ? (low > high[2] or low[1] > high[3]) : (high < low[2] or high[1] < low[3])
+    [roomP, roomN] = qNextLevel(d, close, 0.0)
+    float room  = na(roomP) ? na : math.abs(roomP - close)
+
+    bool c1 = swept != ""
+    bool c2 = fvg or (not na(qBodyAtr) and qBodyAtr >= qStrongBody)
+    bool c3 = qInWin
+    bool c4 = qHtfBias == d
+    bool c5 = na(room) or room / qPip >= qMinRoom
+    int  n  = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3 ? 1 : 0) + (c4 ? 1 : 0) + (c5 ? 1 : 0)
+    string g    = n >= 4 ? "◎" : n == 3 ? "○" : "✕"
+    string word = n >= 4 ? "強い" : n == 3 ? "普通" : "弱い・騙し注意"
+
+    // 損切り：狩りの先端の外側 / 利確1：1R / 利確2：次の重要ライン（1.5R以上先）なければ2R
+    float entry = close
+    float sl    = d == 1 ? ext - nz(atrVal) * pSlBuf : ext + nz(atrVal) * pSlBuf
+    float risk  = math.abs(entry - sl)
+    float tp1   = entry + d * risk * pTp1R
+    [lvP, lvN]  = qNextLevel(d, entry, risk * pTp2MinR)
+    float tp2   = na(lvP) ? entry + d * risk * pTp2DefR : lvP
+    string tp2Nm = na(lvP) ? str.tostring(pTp2DefR, "#.#") + "R" : lvN
+    bool  wideSL = risk > nz(atrVal) * 3
+
+    string[] ok = array.new_string()
+    string[] ng = array.new_string()
+    if c1
+        array.push(ok, swept + "の狩り")
+    else
+        array.push(ng, "小さい狩り")
+    if c2
+        array.push(ok, "強い抜け")
+    else
+        array.push(ng, "弱い抜け")
+    if c3
+        array.push(ok, qWinNm)
+    else
+        array.push(ng, "時間外")
+    if c4
+        array.push(ok, "1H目線一致")
+    else
+        array.push(ng, "1H目線逆")
+    string roomS = na(room) ? "余地あり" : "余地" + str.tostring(room / qPip, "#") + qUnit
+    if c5
+        array.push(ok, roomS)
+    else
+        array.push(ng, roomS + "不足")
+    if wideSL
+        array.push(ng, "損切り幅が広い")
+
+    if qShowGrade
+        string txt = "強さ " + g + " " + word + "（" + str.tostring(n) + "/5）" + (array.size(ok) > 0 ? "\n" + array.join(ok, "・") : "") + (array.size(ng) > 0 ? "\n⚠ " + array.join(ng, "・") : "")
+        color  bg  = g == "◎" ? color.new(color.lime, 0) : g == "○" ? color.new(color.yellow, 0) : color.new(color.gray, 0)
+        // 元の「🎯」ラベルと重ならないよう反対側（買い＝足の上／売り＝足の下）に出す
+        label.new(bar_index, d == 1 ? high : low, txt, yloc=d == 1 ? yloc.abovebar : yloc.belowbar, style=d == 1 ? label.style_label_down : label.style_label_up, color=bg, textcolor=color.black, size=size.normal)
+
+    if risk > 0 and not na(sl)
+        // 前の計画のラインは消す（ライン数の上限で元のサポレジ線が消えないように）
+        line.delete(lnE)
+        line.delete(lnS)
+        line.delete(lnT1)
+        line.delete(lnT2)
+        label.delete(lbE)
+        label.delete(lbS)
+        label.delete(lbT1)
+        label.delete(lbT2)
+        tDir := d
+        tBar := bar_index
+        tEntry := entry
+        tSL := sl
+        tTP1 := tp1
+        tTP2 := tp2
+        tLevel := brk
+        tTp1Hit := false
+        tWarned := false
+        tGrade := g + " " + word
+        tStatus := "保有中の想定"
+        if pShowPlan
+            int x2 = bar_index + 20
+            lnE  := line.new(bar_index, entry, x2, entry, color=color.new(color.white, 0), width=2)
+            lnS  := line.new(bar_index, sl, x2, sl, color=color.new(color.red, 0), width=2)
+            lnT1 := line.new(bar_index, tp1, x2, tp1, color=color.new(color.lime, 30), width=1, style=line.style_dashed)
+            lnT2 := line.new(bar_index, tp2, x2, tp2, color=color.new(color.lime, 0), width=2)
+            lbE  := label.new(x2, entry, "エントリー " + qFmtP(entry), style=label.style_label_left, color=color.new(color.white, 20), textcolor=color.black, size=size.small)
+            lbS  := label.new(x2, sl, "損切り " + qFmtP(sl) + "（" + qFmtPips((sl - entry) * d) + "）", style=label.style_label_left, color=color.new(color.red, 20), textcolor=color.white, size=size.small)
+            lbT1 := label.new(x2, tp1, "利確1 " + qFmtP(tp1) + "（" + qFmtPips((tp1 - entry) * d) + "）半分利確→建値へ", style=label.style_label_left, color=color.new(color.lime, 50), textcolor=color.black, size=size.small)
+            lbT2 := label.new(x2, tp2, "利確2 " + tp2Nm + " " + qFmtP(tp2) + "（" + qFmtPips((tp2 - entry) * d) + "）", style=label.style_label_left, color=color.new(color.lime, 20), textcolor=color.black, size=size.small)
+        alert(syminfo.ticker + " 5分足：3根拠成立（" + (d == 1 ? "買い" : "売り") + "）強さ " + g + " " + word + "／エントリー " + qFmtP(entry) + "／損切り " + qFmtP(sl) + "／利確1 " + qFmtP(tp1) + "／利確2 " + qFmtP(tp2) + "。最終判断はご自身で。", alert.freq_once_per_bar_close)
+    qStrongBuy  := d == 1 and g == "◎"
+    qStrongSell := d == -1 and g == "◎"
+
+else if barstate.isconfirmed and tDir != 0 and bar_index > tBar  // 入った後の追跡（騙し警告・結果）
+    bool hitSL = tDir == 1 ? low <= tSL : high >= tSL
+    bool hitT1 = tDir == 1 ? high >= tTP1 : low <= tTP1
+    bool hitT2 = tDir == 1 ? high >= tTP2 : low <= tTP2
+    float yPos = tDir == 1 ? high : low
+    if hitSL
+        // 同じ足で損切りと利確の両方に触れた場合は、保守的に損切りとして扱う
+        tStatus := qFinish(tTp1Hit ? "建値で終了" : "損切り")
+        label.new(bar_index, tDir == 1 ? low : high, tTp1Hit ? "➖ 建値で終了" : "❌ 損切り", yloc=tDir == 1 ? yloc.belowbar : yloc.abovebar, style=tDir == 1 ? label.style_label_up : label.style_label_down, color=color.new(tTp1Hit ? color.gray : color.red, 20), textcolor=color.white, size=size.small)
+        tDir := 0
+    else if hitT2
+        tStatus := qFinish("利確2到達")
+        label.new(bar_index, yPos, "✅ 利確2到達", yloc=tDir == 1 ? yloc.abovebar : yloc.belowbar, style=tDir == 1 ? label.style_label_down : label.style_label_up, color=color.new(color.lime, 10), textcolor=color.black, size=size.small)
+        tDir := 0
+    else
+        if hitT1 and not tTp1Hit
+            tTp1Hit := true
+            tSL := tEntry
+            tStatus := "利確1到達（損切りを建値へ）"
+            line.set_y1(lnS, tEntry)
+            line.set_y2(lnS, tEntry)
+            label.set_y(lbS, tEntry)
+            label.set_text(lbS, "損切り → 建値 " + qFmtP(tEntry))
+            label.new(bar_index, yPos, "✅ 利確1到達\n損切りを建値へ", yloc=tDir == 1 ? yloc.abovebar : yloc.belowbar, style=tDir == 1 ? label.style_label_down : label.style_label_up, color=color.new(color.lime, 40), textcolor=color.black, size=size.small)
+            alert(syminfo.ticker + " 5分足：利確1到達。損切りを建値へ。", alert.freq_once_per_bar_close)
+        // 騙し警告：利確1の前に、ブレイクしたラインの内側で足が確定した（ルール：ライン内側で確定したら撤退）
+        if not tTp1Hit and not tWarned and not na(tLevel) and (tDir == 1 ? close < tLevel : close > tLevel)
+            tWarned := true
+            tStatus := "騙し注意（撤退検討）"
+            label.new(bar_index, yPos, "⚠ ラインの内側で確定\n騙しの可能性・撤退検討", yloc=tDir == 1 ? yloc.abovebar : yloc.belowbar, style=tDir == 1 ? label.style_label_down : label.style_label_up, color=color.new(color.orange, 10), textcolor=color.black, size=size.small)
+            alert(syminfo.ticker + " 5分足：ブレイクしたラインの内側で確定。騙しの可能性・撤退検討。", alert.freq_once_per_bar_close)
+        if tDir != 0 and bar_index - tBar >= pMaxHold
+            tStatus := qFinish("時間切れ（追跡終了）")
+            tDir := 0
+
+// ==================== 追加：アラート・表 ====================
+alertcondition(qStrongBuy,  title="3根拠成立(買い)＋強さ◎", message="3根拠成立（買い）で強さ◎。チャートでエントリー・損切り・利確を確認してください。")
+alertcondition(qStrongSell, title="3根拠成立(売り)＋強さ◎", message="3根拠成立（売り）で強さ◎。チャートでエントリー・損切り・利確を確認してください。")
+
+var table qTbl = table.new(position.bottom_right, 2, 6, bgcolor=color.new(color.black, 25), border_width=1, border_color=color.new(color.gray, 60))
+if barstate.islast and pShowTable
+    table.cell(qTbl, 0, 0, "直近の計画", text_color=color.white, text_size=size.small)
+    table.cell(qTbl, 1, 0, tGrade == "" ? "-" : tGrade, text_color=color.white, text_size=size.small)
+    table.cell(qTbl, 0, 1, "状態", text_color=color.white, text_size=size.small)
+    table.cell(qTbl, 1, 1, tStatus, text_color=color.white, text_size=size.small)
+    table.cell(qTbl, 0, 2, "エントリー", text_color=color.white, text_size=size.small)
+    table.cell(qTbl, 1, 2, na(tEntry) ? "-" : qFmtP(tEntry), text_color=color.white, text_size=size.small)
+    table.cell(qTbl, 0, 3, "損切り", text_color=color.red, text_size=size.small)
+    table.cell(qTbl, 1, 3, na(tSL) ? "-" : qFmtP(tSL), text_color=color.white, text_size=size.small)
+    table.cell(qTbl, 0, 4, "利確1", text_color=color.lime, text_size=size.small)
+    table.cell(qTbl, 1, 4, na(tTP1) ? "-" : qFmtP(tTP1), text_color=color.white, text_size=size.small)
+    table.cell(qTbl, 0, 5, "利確2", text_color=color.lime, text_size=size.small)
+    table.cell(qTbl, 1, 5, na(tTP2) ? "-" : qFmtP(tTP2), text_color=color.white, text_size=size.small)
