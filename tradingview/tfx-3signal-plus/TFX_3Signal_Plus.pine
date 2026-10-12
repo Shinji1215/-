@@ -161,6 +161,9 @@ pTp2MinR   = input.float(1.5, "利確2：重要ラインを使う最低R", minva
 pTp2DefR   = input.float(2.0, "利確2：重要ラインがない時のR", minval=0.5, step=0.1, group=grpP)
 pMaxHold   = input.int(48, "結果を追う最大本数（48本＝4時間）", minval=1, group=grpP)
 pShowTable = input.bool(false, "右下に計画の表を表示", group=grpP)
+pShowEntry = input.bool(true, "エントリー価格を矢印ラベルで表示（すぐIN）", group=grpP)
+pShowRetest = input.bool(true, "戻り待ちエントリーも表示（ブレイクしたラインまで戻ったら）", group=grpP)
+pRetestBars = input.int(12, "戻り待ちの有効本数（12本＝1時間）", minval=1, group=grpP)
 
 grpT = "追加③ 時間帯（日本時間の夏冬は自動）"
 qAsiaSess = input.session("0700-1500", "アジア時間（日本時間）", group=grpT)
@@ -259,6 +262,8 @@ qFmtP(float p) =>
     str.tostring(p, format.mintick)
 qFmtPips(float d) =>
     (d >= 0 ? "+" : "") + str.tostring(d / qPip, "#") + qUnit
+qAbsPips(float d) =>
+    str.tostring(math.abs(d) / qPip, "#") + qUnit
 
 // ==================== 追加：3根拠成立時の強さ判定と計画 ====================
 var int   tDir    = 0
@@ -280,6 +285,9 @@ var label lbE  = na
 var label lbS  = na
 var label lbT1 = na
 var label lbT2 = na
+var line  lnR  = na
+var float tRetest     = na
+var bool  tRetestOpen = false
 
 qStrongBuy  = false
 qStrongSell = false
@@ -392,6 +400,17 @@ if barstate.isconfirmed and (buySignal or sellSignal) and not (buySignal and sel
             lbS  := label.new(x2, sl, "損切り " + qFmtP(sl) + "（" + qFmtPips((sl - entry) * d) + "）", style=label.style_label_left, color=color.new(color.red, 20), textcolor=color.white, size=size.small)
             lbT1 := label.new(x2, tp1, "利確1 " + qFmtP(tp1) + "（" + qFmtPips((tp1 - entry) * d) + "）半分利確→建値へ", style=label.style_label_left, color=color.new(color.lime, 50), textcolor=color.black, size=size.small)
             lbT2 := label.new(x2, tp2, "利確2 " + tp2Nm + " " + qFmtP(tp2) + "（" + qFmtPips((tp2 - entry) * d) + "）", style=label.style_label_left, color=color.new(color.lime, 20), textcolor=color.black, size=size.small)
+        // エントリー価格（矢印＋価格ラベル）：すぐIN＝この足の終値／戻り待ちIN＝ブレイクしたライン
+        bool retestOk = pShowRetest and not na(brk) and (d == 1 ? brk < entry and brk > sl : brk > entry and brk < sl)
+        line.delete(lnR)
+        lnR := na
+        tRetest := retestOk ? brk : na
+        tRetestOpen := retestOk
+        if pShowEntry
+            label.new(bar_index, entry, (d == 1 ? "買い" : "売り") + " ▶ すぐIN " + qFmtP(entry) + "（損切りまで" + qAbsPips(entry - sl) + "）", style=label.style_label_right, color=color.new(color.white, 0), textcolor=color.black, size=size.small)
+            if retestOk
+                label.new(bar_index, brk, (d == 1 ? "買い" : "売り") + " ▶ 戻り待ちIN " + qFmtP(brk) + "（損切りまで" + qAbsPips(brk - sl) + "）", style=label.style_label_right, color=color.new(color.aqua, 0), textcolor=color.black, size=size.small)
+                lnR := line.new(bar_index, brk, bar_index + pRetestBars, brk, color=color.new(color.aqua, 0), width=1, style=line.style_dotted)
         alert(syminfo.ticker + " 5分足：3根拠成立（" + (d == 1 ? "買い" : "売り") + "）強さ " + g + " " + word + "／エントリー " + qFmtP(entry) + "／損切り " + qFmtP(sl) + "／利確1 " + qFmtP(tp1) + "／利確2 " + qFmtP(tp2) + "。最終判断はご自身で。", alert.freq_once_per_bar_close)
     qStrongBuy  := d == 1 and g == "◎"
     qStrongSell := d == -1 and g == "◎"
@@ -401,6 +420,16 @@ else if barstate.isconfirmed and tDir != 0 and bar_index > tBar  // 入った後
     bool hitT1 = tDir == 1 ? high >= tTP1 : low <= tTP1
     bool hitT2 = tDir == 1 ? high >= tTP2 : low <= tTP2
     float yPos = tDir == 1 ? high : low
+    // 戻り待ちエントリー：有効本数内にブレイクしたラインまで戻ったか
+    if tRetestOpen
+        if tDir == 1 ? low <= tRetest : high >= tRetest
+            tRetestOpen := false
+            label.new(bar_index, tRetest, "↩ 戻り待ちIN 到達 " + qFmtP(tRetest), style=label.style_label_right, color=color.new(color.aqua, 30), textcolor=color.black, size=size.tiny)
+            alert(syminfo.ticker + " 5分足：戻り待ちの価格 " + qFmtP(tRetest) + " に到達。", alert.freq_once_per_bar_close)
+        else if bar_index - tBar >= pRetestBars or tTp1Hit
+            tRetestOpen := false
+            if not na(lnR)
+                line.set_x2(lnR, bar_index)
     if hitSL
         // 同じ足で損切りと利確の両方に触れた場合は、保守的に損切りとして扱う
         tStatus := qFinish(tTp1Hit ? "建値で終了" : "損切り")
