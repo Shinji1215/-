@@ -1,0 +1,346 @@
+//@version=6
+// =====================================================================
+// TFX 流動性マップ ＋ セットアップ採点
+// ---------------------------------------------------------------------
+// ・既存インジケーター（Liquidity Grab / EMA 8・50 / BOS）とは独立した別スクリプト。既存コードは参照しない。
+// ・重要ライン（前日高安・アジア高安・ロンドン高安）を自動で引き、
+//   「どの重要ラインを狩ったか」→「その後のBOS」→ チェック5項目 を★で採点する。
+// ・★はチェックが揃った数。勝率ではない。売買サインではない。
+// ・判定はすべて確定足。上位足は request.security(...[1], lookahead_on) で確定済みの値のみ使用（リペイントなし）。
+// ・スイングは右側 swingLen 本の確定を待つ（遅延あり・後から書き換わらない）。
+// ・しきい値はすべて検証用の初期値。
+// =====================================================================
+indicator("TFX 流動性マップ＋セットアップ採点", shorttitle = "TFX-LiqMap", overlay = true, max_labels_count = 300, max_boxes_count = 100)
+
+// ───────────────────────── Inputs ─────────────────────────
+GRP_D = "① 表示"
+showPanel  = input.bool(true, "パネルを表示", group = GRP_D)
+panelPos   = input.string("右上", "パネル位置", options = ["右上", "右下", "左上", "左下"], group = GRP_D)
+panelSize  = input.string("小", "文字サイズ", options = ["極小", "小", "標準"], group = GRP_D)
+showLevels = input.bool(true, "重要ラインを表示", group = GRP_D)
+showLG     = input.bool(true, "重要ラインの『狩り』ラベルを表示", group = GRP_D)
+showSetup  = input.bool(true, "セットアップ（狩り→BOS）ラベルを表示", group = GRP_D)
+showFvg    = input.bool(true, "FVG（戻り待ちゾーン）を表示", group = GRP_D)
+minStars   = input.int(1, "ラベルを出す最低★数", minval = 1, maxval = 5, group = GRP_D)
+
+GRP_L = "② 重要ライン"
+usePD       = input.bool(true, "前日高値・安値", group = GRP_L)
+useAsia     = input.bool(true, "アジア高値・安値", group = GRP_L)
+asiaSess    = input.session("0700-1500", "アジア時間（日本時間）", group = GRP_L)
+asiaAMSess  = input.session("0700-1200", "アジア前場（12時に一度ラインを確定）", group = GRP_L)
+useLon      = input.bool(true, "ロンドン高値・安値", group = GRP_L)
+lonSess     = input.session("0800-1200", "ロンドン時間（ロンドン現地時間）", group = GRP_L)
+reclaimBars = input.int(3, "狩り判定：ラインを抜けてから戻るまでの最大本数", minval = 1, group = GRP_L)
+
+GRP_T = "③ トレード時間帯（夏時間は自動）"
+useWAsia = input.bool(true, "アジア後半", group = GRP_T)
+wAsia    = input.session("1200-1500", "アジア後半（日本時間）", group = GRP_T)
+useWPre  = input.bool(true, "プリロンドン", group = GRP_T)
+wPre     = input.session("0700-0800", "プリロンドン（ロンドン現地時間）", group = GRP_T)
+useWLon  = input.bool(true, "ロンドン", group = GRP_T)
+wLon     = input.session("0800-1100", "ロンドン（ロンドン現地時間）", group = GRP_T)
+useWNY   = input.bool(true, "NY・NYSE", group = GRP_T)
+wNY      = input.session("0800-1130", "NY（NY現地時間）", group = GRP_T)
+wNYSE    = input.session("0930-1130", "うちNYSEオープン（NY現地時間）", group = GRP_T)
+
+GRP_S = "④ セットアップ判定"
+swingLen    = input.int(3, "スイング確定本数（左右）", minval = 1, group = GRP_S)
+setupWindow = input.int(24, "狩りの後BOSを待つ最大本数（24本＝2時間）", minval = 1, group = GRP_S)
+strongBody  = input.float(0.8, "強い抜け：BOS足の実体 ≧ ATR ×", minval = 0.1, step = 0.1, group = GRP_S)
+htfTf       = input.timeframe("60", "目線を見る時間足", group = GRP_S)
+minRoom     = input.float(30, "次のラインまでの最低余地（pips）", minval = 0, group = GRP_S)
+pipOverride = input.float(0.0, "1pipの値幅（0＝自動：XAU 0.1／その他 1.0）", minval = 0.0, group = GRP_S)
+
+// ───────────────────────── 基本データ ─────────────────────────
+float atr     = ta.atr(14)
+float bodyATR = nz(atr[1]) > 0 ? math.abs(close - open) / atr[1] : na
+bool  isXAU   = str.contains(syminfo.ticker, "XAU")
+float pip     = pipOverride > 0 ? pipOverride : isXAU ? 0.1 : 1.0
+string unit   = isXAU or pipOverride > 0 ? "pips" : "pt"
+
+// 上位足（確定済みの値のみ）
+float pdh   = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+float pdl   = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
+float hFast = request.security(syminfo.tickerid, htfTf, ta.ema(close, 8)[1], lookahead = barmerge.lookahead_on)
+float hSlow = request.security(syminfo.tickerid, htfTf, ta.ema(close, 50)[1], lookahead = barmerge.lookahead_on)
+int   htfBias = na(hFast) or na(hSlow) ? 0 : hFast > hSlow ? 1 : hFast < hSlow ? -1 : 0
+
+// セッション判定（time() は毎足呼ぶ）
+bool inAsia   = not na(time(timeframe.period, asiaSess, "Asia/Tokyo"))
+bool inAsiaAM = not na(time(timeframe.period, asiaAMSess, "Asia/Tokyo"))
+bool inLon    = not na(time(timeframe.period, lonSess, "Europe/London"))
+bool tA = not na(time(timeframe.period, wAsia, "Asia/Tokyo"))
+bool tP = not na(time(timeframe.period, wPre, "Europe/London"))
+bool tL = not na(time(timeframe.period, wLon, "Europe/London"))
+bool tN = not na(time(timeframe.period, wNY, "America/New_York"))
+bool tS = not na(time(timeframe.period, wNYSE, "America/New_York"))
+bool inWin   = (useWAsia and tA) or (useWPre and tP) or (useWLon and tL) or (useWNY and tN)
+string winNm = useWNY and tN ? (tS ? "NYSE" : "NY") : useWLon and tL ? "ロンドン" : useWPre and tP ? "プリロンドン" : useWAsia and tA ? "アジア後半" : "時間外"
+
+// ───────────────────────── 重要ライン ─────────────────────────
+type Level
+    string name
+    int    side            // +1 = 上の流動性（高値） -1 = 下の流動性（安値）
+    float  price   = na
+    bool   active  = false
+    int    pendBar = na
+    float  pendExt = na
+
+method setPrice(Level l, float p) =>
+    if not na(p) and (na(l.price) or p != l.price)
+        l.price   := p
+        l.active  := true
+        l.pendBar := na
+        l.pendExt := na
+
+var array<Level> lv = array.from(Level.new("前日高値", 1), Level.new("前日安値", -1), Level.new("アジア高値", 1), Level.new("アジア安値", -1), Level.new("ロンドン高値", 1), Level.new("ロンドン安値", -1))
+
+// 前日高安：日が変わったら更新
+if usePD and not na(pdh) and pdh != nz(pdh[1])
+    lv.get(0).setPrice(pdh)
+if usePD and not na(pdl) and pdl != nz(pdl[1])
+    lv.get(1).setPrice(pdl)
+
+// アジア・ロンドン：セッション中の高安を記録し、終了時（アジアは12時にも）ラインとして確定
+var float aH = na
+var float aL = na
+var float lH = na
+var float lL = na
+bool asiaStart = inAsia and not inAsia[1]
+bool asiaAMEnd = not inAsiaAM and inAsiaAM[1]
+bool asiaEnd   = not inAsia and inAsia[1]
+bool lonStart  = inLon and not inLon[1]
+bool lonEnd    = not inLon and inLon[1]
+if useAsia and (asiaAMEnd or asiaEnd)
+    lv.get(2).setPrice(aH)
+    lv.get(3).setPrice(aL)
+if useLon and lonEnd
+    lv.get(4).setPrice(lH)
+    lv.get(5).setPrice(lL)
+if asiaStart
+    aH := high
+    aL := low
+else if inAsia
+    aH := math.max(aH, high)
+    aL := math.min(aL, low)
+if lonStart
+    lH := high
+    lL := low
+else if inLon
+    lH := math.max(lH, high)
+    lL := math.min(lL, low)
+
+// ───────────────────────── スイングとBOS ─────────────────────────
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+var float swingHigh = na
+var float swingLow  = na
+var bool  shBroken  = false
+var bool  slBroken  = false
+if not na(ph)
+    swingHigh := ph
+    shBroken  := false
+if not na(pl)
+    swingLow := pl
+    slBroken := false
+bool bosUp = not na(swingHigh) and not shBroken and close > swingHigh
+bool bosDn = not na(swingLow) and not slBroken and close < swingLow
+if bosUp
+    shBroken := true
+if bosDn
+    slBroken := true
+
+// ───────────────────────── 補助関数 ─────────────────────────
+starsText(int n) =>
+    string s = ""
+    for i = 1 to 5
+        s += i <= n ? "★" : "☆"
+    s
+starColor(int n) =>
+    n >= 5 ? color.new(color.lime, 0) : n == 4 ? color.new(color.teal, 0) : n == 3 ? color.new(color.yellow, 0) : color.new(color.gray, 0)
+pipsText(float d) =>
+    str.tostring(d / pip, "#") + unit
+
+// 価格 p から dir 方向（+1 上 / -1 下）で一番近い未使用の重要ライン
+nearestIdx(float p, int dir) =>
+    int   best  = -1
+    float bestD = na
+    for i = 0 to 5
+        Level l = lv.get(i)
+        if l.active and not na(l.price)
+            float d = (l.price - p) * dir
+            if d > 0 and (na(bestD) or d < bestD)
+                best  := i
+                bestD := d
+    best
+
+// ───────────────────────── 狩り → BOS → 採点 ─────────────────────────
+var int    lgDir  = 0      // +1 = 安値を狩った（買いの準備） -1 = 高値を狩った（売りの準備）
+var int    lgBar  = na
+var string lgName = ""
+
+var int    sDir    = 0
+var int    sBar    = na
+var int    sStars  = 0
+var string sName   = ""
+var bool   sStrong = false
+var bool   sFvg    = false
+var bool   sWin    = false
+var string sWinNm  = ""
+var bool   sHtf    = false
+var float  sRoom   = na
+var string sRoomNm = ""
+
+bool setupBuy  = false
+bool setupSell = false
+bool lgNow     = false
+
+if barstate.isconfirmed
+    // 1) 重要ラインの狩り（抜けて reclaimBars 本以内に終値で戻る）
+    for i = 0 to 5
+        Level l = lv.get(i)
+        if l.active and not na(l.price)
+            if na(l.pendBar)
+                if (l.side == 1 and high > l.price) or (l.side == -1 and low < l.price)
+                    l.pendBar := bar_index
+                    l.pendExt := l.side == 1 ? high : low
+            else
+                l.pendExt := l.side == 1 ? math.max(l.pendExt, high) : math.min(l.pendExt, low)
+            if not na(l.pendBar)
+                if (l.side == 1 and close < l.price) or (l.side == -1 and close > l.price)
+                    l.active := false
+                    lgDir    := -l.side
+                    lgBar    := bar_index
+                    lgName   := l.name
+                    lgNow    := true
+                    if showLG
+                        label.new(bar_index, l.side == 1 ? high : low, "狩り：" + l.name, yloc = l.side == 1 ? yloc.abovebar : yloc.belowbar, style = l.side == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.purple, 10), textcolor = color.white, size = size.tiny, text_formatting = text.format_bold)
+                    alert(syminfo.ticker + " 5分足：" + l.name + " を狩りました（BOS待ち）。売買サインではありません。", alert.freq_once_per_bar_close)
+                else if bar_index - l.pendBar >= reclaimBars
+                    l.active := false   // 戻らずに抜けた＝ブレイク（狩りではない）
+
+    // 2) 期限切れ
+    if lgDir != 0 and bar_index - lgBar > setupWindow
+        lgDir := 0
+
+    // 3) 狩りと同じ向きのBOSでセットアップ成立
+    if lgDir != 0 and ((lgDir == 1 and bosUp) or (lgDir == -1 and bosDn))
+        int  d    = lgDir
+        bool fvg0 = d == 1 ? low > high[2] : high < low[2]
+        bool fvg1 = d == 1 ? low[1] > high[3] : high[1] < low[3]
+        bool strongB = fvg0 or fvg1 or (not na(bodyATR) and bodyATR >= strongBody)
+        int  ni   = nearestIdx(close, d)
+        float room = ni >= 0 ? math.abs(lv.get(ni).price - close) : na
+        bool roomOk = na(room) or room / pip >= minRoom
+        bool htfOk  = htfBias == d
+        int  stars  = 1 + (strongB ? 1 : 0) + (inWin ? 1 : 0) + (htfOk ? 1 : 0) + (roomOk ? 1 : 0)
+
+        sDir    := d
+        sBar    := bar_index
+        sStars  := stars
+        sName   := lgName
+        sStrong := strongB
+        sFvg    := fvg0 or fvg1
+        sWin    := inWin
+        sWinNm  := winNm
+        sHtf    := htfOk
+        sRoom   := room
+        sRoomNm := ni >= 0 ? lv.get(ni).name : ""
+        setupBuy  := d == 1
+        setupSell := d == -1
+
+        if showSetup and stars >= minStars
+            string t = (d == 1 ? "BUY " : "SELL ") + starsText(stars) + "\n" + lgName + "狩り→BOS"
+            label.new(bar_index, d == 1 ? low : high, t, yloc = d == 1 ? yloc.belowbar : yloc.abovebar, style = d == 1 ? label.style_label_up : label.style_label_down, color = starColor(stars), textcolor = color.black, size = size.normal, text_formatting = text.format_bold)
+        if showFvg and stars >= minStars and (fvg0 or fvg1)
+            int   k   = fvg0 ? 0 : 1
+            float top = d == 1 ? low[k] : low[k + 2]
+            float bot = d == 1 ? high[k + 2] : high[k]
+            box.new(bar_index - k - 2, top, bar_index + 12, bot, border_color = na, bgcolor = d == 1 ? color.new(color.teal, 80) : color.new(color.red, 80), text = "戻り待ち（FVG）", text_size = size.tiny, text_color = color.new(color.white, 30))
+        alert(syminfo.ticker + " 5分足：" + (d == 1 ? "BUY " : "SELL ") + starsText(stars) + "（" + lgName + "狩り→BOS）。3つの根拠で最終確認を。売買サインではありません。", alert.freq_once_per_bar_close)
+        lgDir := 0
+
+// ───────────────────────── 描画：重要ライン ─────────────────────────
+lvPlot(int i) =>
+    Level l = lv.get(i)
+    showLevels and l.active ? l.price : na
+float p0 = lvPlot(0)
+float p1 = lvPlot(1)
+float p2 = lvPlot(2)
+float p3 = lvPlot(3)
+float p4 = lvPlot(4)
+float p5 = lvPlot(5)
+color cHi = color.new(color.red, 30)
+color cLo = color.new(color.teal, 30)
+plot(p0 != p0[1] ? na : p0, "前日高値",     color = cHi, linewidth = 2, style = plot.style_linebr)
+plot(p1 != p1[1] ? na : p1, "前日安値",     color = cLo, linewidth = 2, style = plot.style_linebr)
+plot(p2 != p2[1] ? na : p2, "アジア高値",   color = cHi, linewidth = 1, style = plot.style_linebr)
+plot(p3 != p3[1] ? na : p3, "アジア安値",   color = cLo, linewidth = 1, style = plot.style_linebr)
+plot(p4 != p4[1] ? na : p4, "ロンドン高値", color = cHi, linewidth = 1, style = plot.style_linebr)
+plot(p5 != p5[1] ? na : p5, "ロンドン安値", color = cLo, linewidth = 1, style = plot.style_linebr)
+
+// ライン名（最新足の右側）
+var array<label> lvLabels = array.new<label>()
+if barstate.islast and showLevels
+    for lb in lvLabels
+        label.delete(lb)
+    lvLabels.clear()
+    for i = 0 to 5
+        Level l = lv.get(i)
+        if l.active and not na(l.price)
+            lvLabels.push(label.new(bar_index + 3, l.price, l.name, style = label.style_none, textcolor = l.side == 1 ? cHi : cLo, size = size.small))
+
+// ───────────────────────── アラート ─────────────────────────
+alertcondition(setupBuy,  "TFX-LiqMap: BUYセットアップ",  "{{ticker}} 5分足：重要ラインの狩り→BOS（BUY側）。3つの根拠で最終確認を。売買サインではありません。")
+alertcondition(setupSell, "TFX-LiqMap: SELLセットアップ", "{{ticker}} 5分足：重要ラインの狩り→BOS（SELL側）。3つの根拠で最終確認を。売買サインではありません。")
+alertcondition(lgNow,     "TFX-LiqMap: 重要ラインの狩り", "{{ticker}} 5分足：重要ラインを狩りました（BOS待ち）。")
+
+// ───────────────────────── パネル ─────────────────────────
+pnlPos(string p) =>
+    switch p
+        "右上" => position.top_right
+        "右下" => position.bottom_right
+        "左上" => position.top_left
+        => position.bottom_left
+txtSize(string s) =>
+    switch s
+        "極小" => size.tiny
+        "標準" => size.normal
+        => size.small
+
+var table panel = table.new(pnlPos(panelPos), 2, 10, bgcolor = color.new(color.black, 20), border_color = color.new(color.gray, 60), border_width = 1)
+
+if barstate.islast and showPanel
+    table.clear(panel, 0, 0, 1, 9)
+    ts   = txtSize(panelSize)
+    cTxt = color.white
+    cOk  = color.new(color.lime, 0)
+    cNg  = color.new(color.orange, 0)
+    int  off = barstate.isconfirmed ? 0 : 1
+
+    table.cell(panel, 0, 0, "🎯 セットアップ", text_color = cTxt, text_size = ts, text_halign = text.align_left, text_formatting = text.format_bold)
+    table.cell(panel, 1, 0, "※売買サインではありません", text_color = color.new(color.silver, 0), text_size = ts, text_halign = text.align_right)
+
+    if sDir == 0
+        table.cell(panel, 0, 1, "まだなし", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+        table.cell(panel, 1, 1, "重要ラインの狩り→BOSを待っています", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+    else
+        color bg = starColor(sStars)
+        table.cell(panel, 0, 1, (sDir == 1 ? "BUY " : "SELL ") + starsText(sStars), text_color = color.black, bgcolor = bg, text_size = ts, text_halign = text.align_left, text_formatting = text.format_bold)
+        table.cell(panel, 1, 1, str.tostring(bar_index - off - sBar) + "本前", text_color = color.black, bgcolor = bg, text_size = ts, text_halign = text.align_left, text_formatting = text.format_bold)
+        array<string> rows = array.from("✅ " + sName + "を狩った", sStrong ? "✅ 強い抜け" + (sFvg ? "（FVGあり）" : "（実体大）") : "⚠ 弱い抜け（だましに注意）", sWin ? "✅ " + sWinNm : "⚠ 時間外", sHtf ? "✅ 1時間足の目線と一致" : "⚠ 1時間足の目線と逆・不明", na(sRoom) ? "✅ 先に重要ラインなし" : sRoom / pip >= minRoom ? "✅ 次の" + sRoomNm + "まで " + pipsText(sRoom) : "⚠ 次の" + sRoomNm + "まで " + pipsText(sRoom) + "（" + str.tostring(minRoom, "#") + "未満）")
+        for r = 0 to 4
+            string t = rows.get(r)
+            table.cell(panel, 0, 2 + r, str.substring(t, 0, 1), text_size = ts)
+            table.cell(panel, 1, 2 + r, str.substring(t, 2), text_color = str.startswith(t, "✅") ? cOk : cNg, text_size = ts, text_halign = text.align_left)
+
+    // いまの状況
+    string nowTxt = lgDir != 0 ? lgName + "を狩った → BOS待ち" : "重要ラインの狩り待ち"
+    table.cell(panel, 0, 7, "いま（" + winNm + "）", text_color = inWin ? cOk : cNg, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 1, 7, nowTxt, text_color = cTxt, text_size = ts, text_halign = text.align_left)
+    int up = nearestIdx(close, 1)
+    int dn = nearestIdx(close, -1)
+    table.cell(panel, 0, 8, "↑ 上のライン", text_color = cHi, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 1, 8, up >= 0 ? lv.get(up).name + " まで " + pipsText(lv.get(up).price - close) : "なし", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 0, 9, "↓ 下のライン", text_color = cLo, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 1, 9, dn >= 0 ? lv.get(dn).name + " まで " + pipsText(close - lv.get(dn).price) : "なし", text_color = cTxt, text_size = ts, text_halign = text.align_left)
