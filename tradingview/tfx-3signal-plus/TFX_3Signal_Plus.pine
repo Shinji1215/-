@@ -422,7 +422,7 @@ else if barstate.isconfirmed and tDir != 0 and bar_index > tBar  // 入った後
     float yPos = tDir == 1 ? high : low
     // 戻り待ちエントリー：有効本数内にブレイクしたラインまで戻ったか
     if tRetestOpen
-        if tDir == 1 ? low <= tRetest : high >= tRetest
+        if (tDir == 1 ? low <= tRetest : high >= tRetest)
             tRetestOpen := false
             label.new(bar_index, tRetest, "↩ 戻り待ちIN 到達 " + qFmtP(tRetest), style=label.style_label_right, color=color.new(color.aqua, 30), textcolor=color.black, size=size.tiny)
             alert(syminfo.ticker + " 5分足：戻り待ちの価格 " + qFmtP(tRetest) + " に到達。", alert.freq_once_per_bar_close)
