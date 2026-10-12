@@ -1,0 +1,266 @@
+//@version=6
+// =====================================================================
+// TFX 3根拠クオリティ判定
+// ---------------------------------------------------------------------
+// ・既存インジケーター「3根拠システム」(Traders S.S 3) のコードは一切変更しない。
+//   同じ計算（EMA 8/50・スイング5/5・有効期限30本）をこのスクリプト内で再現し、
+//   「🎯 3根拠成立」と同じ足を特定して、そのサインの質を ◎ / ○ / ✕ で表示する。
+// ・質のチェック5項目：①重要ラインの狩りか ②BOSの抜けが強いか ③時間帯 ④1時間足の目線 ⑤次のラインまでの余地
+// ・◎○✕ はチェックが揃った数。勝率ではない。売買サインではない。
+// ・判定は確定足のみ。上位足は確定済みの値のみ使用（リペイントなし）。
+// ・しきい値はすべて検証用の初期値。
+// =====================================================================
+indicator("TFX 3根拠クオリティ判定", shorttitle = "3根拠Q", overlay = true, max_labels_count = 200)
+
+// ───────────────────────── Inputs ─────────────────────────
+GRP_E = "① 3根拠システムと同じ設定（変えたら両方そろえる）"
+emaFastLen   = input.int(8, "EMA短期(本数)", minval = 1, group = GRP_E)
+emaSlowLen   = input.int(50, "EMA長期(本数)", minval = 1, group = GRP_E)
+pivotLeft    = input.int(5, "スイング判定: 左側バー数", minval = 1, group = GRP_E)
+pivotRight   = input.int(5, "スイング判定: 右側バー数", minval = 1, group = GRP_E)
+maxBarsValid = input.int(30, "根拠の有効期限(本数)", minval = 1, group = GRP_E)
+
+GRP_D = "② 表示"
+showWhich  = input.string("すべて", "ラベルを出す判定", options = ["すべて", "◎○だけ", "◎だけ"], group = GRP_D)
+showLine1  = input.bool(true, "右上に直近の判定を1行で表示", group = GRP_D)
+showLevels = input.bool(false, "重要ライン（前日・アジア・ロンドンの高安）を表示", group = GRP_D)
+
+GRP_Q = "③ 質の判定"
+nearTol     = input.float(0.2, "①重要ラインの近さ：ATR ×", minval = 0.0, step = 0.05, group = GRP_Q, tooltip = "狩りの先端が重要ラインからこの距離以内なら『重要ラインの狩り』とみなす。")
+strongBody  = input.float(0.8, "②強い抜け：BOS足の実体 ≧ ATR ×", minval = 0.1, step = 0.1, group = GRP_Q)
+htfTf       = input.timeframe("60", "④目線を見る時間足", group = GRP_Q)
+minRoom     = input.float(30, "⑤次のラインまでの最低余地（pips）", minval = 0, group = GRP_Q)
+pipOverride = input.float(0.0, "1pipの値幅（0＝自動：XAU 0.1／その他 1.0）", minval = 0.0, group = GRP_Q)
+
+GRP_L = "④ 重要ラインの時間"
+asiaSess   = input.session("0700-1500", "アジア時間（日本時間）", group = GRP_L)
+asiaAMSess = input.session("0700-1200", "アジア前場（12時に一度確定）", group = GRP_L)
+lonSess    = input.session("0800-1200", "ロンドン時間（ロンドン現地時間）", group = GRP_L)
+
+GRP_T = "⑤ トレード時間帯（夏時間は自動）"
+wAsia = input.session("1200-1500", "アジア後半（日本時間）", group = GRP_T)
+wPre  = input.session("0700-0800", "プリロンドン（ロンドン現地時間）", group = GRP_T)
+wLon  = input.session("0800-1100", "ロンドン（ロンドン現地時間）", group = GRP_T)
+wNY   = input.session("0800-1130", "NY（NY現地時間）", group = GRP_T)
+wNYSE = input.session("0930-1130", "うちNYSE（NY現地時間）", group = GRP_T)
+
+// ───────────────────────── 3根拠システムの再現（ロジックは既存と同一） ─────────────────────────
+float emaFast = ta.ema(close, emaFastLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+bool bullCross = ta.crossover(emaFast, emaSlow)
+bool bearCross = ta.crossunder(emaFast, emaSlow)
+
+float swingHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+float swingLow  = ta.pivotlow(low, pivotLeft, pivotRight)
+var float resistanceLevel = na
+var float supportLevel    = na
+if not na(swingHigh)
+    resistanceLevel := swingHigh
+if not na(swingLow)
+    supportLevel := swingLow
+
+// v6 は and/or が途中で評価を止めるため、クロス判定は先に毎足計算しておく（v5 の既存インジと結果を一致させる）
+bool cuSup = ta.crossunder(close, supportLevel)
+bool coRes = ta.crossover(close, resistanceLevel)
+bool supportBreakDown  = not na(supportLevel) and cuSup
+bool resistanceBreakUp = not na(resistanceLevel) and coRes
+
+var bool  buyGrabActive  = false
+var int   buyGrabBar     = na
+var bool  buyEmaActive   = false
+var float buyGrabExt     = na
+var bool  sellGrabActive = false
+var int   sellGrabBar    = na
+var bool  sellEmaActive  = false
+var float sellGrabExt    = na
+
+if buyGrabActive and (bar_index - buyGrabBar > maxBarsValid)
+    buyGrabActive := false
+    buyEmaActive  := false
+if sellGrabActive and (bar_index - sellGrabBar > maxBarsValid)
+    sellGrabActive := false
+    sellEmaActive  := false
+
+if supportBreakDown
+    buyGrabActive := true
+    buyGrabBar    := bar_index
+    buyEmaActive  := false
+    buyGrabExt    := low
+else if buyGrabActive
+    buyGrabExt := math.min(buyGrabExt, low)
+if buyGrabActive and bullCross
+    buyEmaActive := true
+bool buySignal = buyGrabActive and buyEmaActive and resistanceBreakUp
+float buyExtAtSignal = buyGrabExt
+if buySignal
+    buyGrabActive := false
+    buyEmaActive  := false
+
+if resistanceBreakUp
+    sellGrabActive := true
+    sellGrabBar    := bar_index
+    sellEmaActive  := false
+    sellGrabExt    := high
+else if sellGrabActive
+    sellGrabExt := math.max(sellGrabExt, high)
+if sellGrabActive and bearCross
+    sellEmaActive := true
+bool sellSignal = sellGrabActive and sellEmaActive and supportBreakDown
+float sellExtAtSignal = sellGrabExt
+if sellSignal
+    sellGrabActive := false
+    sellEmaActive  := false
+
+// ───────────────────────── 質の判定に使うデータ ─────────────────────────
+float atr     = ta.atr(14)
+float bodyATR = nz(atr[1]) > 0 ? math.abs(close - open) / atr[1] : na
+bool  isXAU   = str.contains(syminfo.ticker, "XAU")
+float pip     = pipOverride > 0 ? pipOverride : isXAU ? 0.1 : 1.0
+string unit   = isXAU or pipOverride > 0 ? "pips" : "pt"
+
+float pdh   = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+float pdl   = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
+float hFast = request.security(syminfo.tickerid, htfTf, ta.ema(close, 8)[1], lookahead = barmerge.lookahead_on)
+float hSlow = request.security(syminfo.tickerid, htfTf, ta.ema(close, 50)[1], lookahead = barmerge.lookahead_on)
+int   htfBias = na(hFast) or na(hSlow) ? 0 : hFast > hSlow ? 1 : hFast < hSlow ? -1 : 0
+
+bool inAsia   = not na(time(timeframe.period, asiaSess, "Asia/Tokyo"))
+bool inAsiaAM = not na(time(timeframe.period, asiaAMSess, "Asia/Tokyo"))
+bool inLon    = not na(time(timeframe.period, lonSess, "Europe/London"))
+bool tA = not na(time(timeframe.period, wAsia, "Asia/Tokyo"))
+bool tP = not na(time(timeframe.period, wPre, "Europe/London"))
+bool tL = not na(time(timeframe.period, wLon, "Europe/London"))
+bool tN = not na(time(timeframe.period, wNY, "America/New_York"))
+bool tS = not na(time(timeframe.period, wNYSE, "America/New_York"))
+bool   inWin = tA or tP or tL or tN
+string winNm = tN ? (tS ? "NYSE" : "NY") : tL ? "ロンドン" : tP ? "プリロンドン" : tA ? "アジア後半" : "時間外"
+
+// アジア・ロンドンの高安（セッション終了時に確定。アジアは12時にも一度確定）
+var float aH = na
+var float aL = na
+var float lH = na
+var float lL = na
+var float asiaH = na
+var float asiaL = na
+var float lonH  = na
+var float lonL  = na
+if (not inAsiaAM and inAsiaAM[1]) or (not inAsia and inAsia[1])
+    asiaH := aH
+    asiaL := aL
+if not inLon and inLon[1]
+    lonH := lH
+    lonL := lL
+if inAsia and not inAsia[1]
+    aH := high
+    aL := low
+else if inAsia
+    aH := math.max(aH, high)
+    aL := math.min(aL, low)
+if inLon and not inLon[1]
+    lH := high
+    lL := low
+else if inLon
+    lH := math.max(lH, high)
+    lL := math.min(lL, low)
+
+// ───────────────────────── 判定 ─────────────────────────
+// 狩りの先端 ext が、重要ライン（買い＝安値側／売り＝高値側）を狩って戻っているか
+sweptName(int dir, float ext) =>
+    float tol = nz(atr) * nearTol
+    string nm = ""
+    if dir == 1
+        nm := not na(pdl) and ext <= pdl + tol and close > pdl ? "前日安値" : not na(asiaL) and ext <= asiaL + tol and close > asiaL ? "アジア安値" : not na(lonL) and ext <= lonL + tol and close > lonL ? "ロンドン安値" : ""
+    else
+        nm := not na(pdh) and ext >= pdh - tol and close < pdh ? "前日高値" : not na(asiaH) and ext >= asiaH - tol and close < asiaH ? "アジア高値" : not na(lonH) and ext >= lonH - tol and close < lonH ? "ロンドン高値" : ""
+    nm
+
+// 進む方向で一番近い重要ラインまでの距離（なければ na）
+roomTo(int dir) =>
+    array<float> lv = array.from(pdh, pdl, asiaH, asiaL, lonH, lonL)
+    float best = na
+    for p in lv
+        if not na(p)
+            float d = (p - close) * dir
+            if d > 0 and (na(best) or d < best)
+                best := d
+    best
+
+var int    lastDir   = 0
+var int    lastBar   = na
+var string lastGrade = ""
+int   gradeOut  = 0
+bool  topBuy    = false
+bool  topSell   = false
+
+if barstate.isconfirmed and (buySignal or sellSignal) and not (buySignal and sellSignal)
+    int    d     = buySignal ? 1 : -1
+    float  ext   = d == 1 ? buyExtAtSignal : sellExtAtSignal
+    string swept = sweptName(d, ext)
+    bool   fvg   = d == 1 ? (low > high[2] or low[1] > high[3]) : (high < low[2] or high[1] < low[3])
+    bool   c1    = swept != ""
+    bool   c2    = fvg or (not na(bodyATR) and bodyATR >= strongBody)
+    bool   c3    = inWin
+    bool   c4    = htfBias == d
+    float  room  = roomTo(d)
+    bool   c5    = na(room) or room / pip >= minRoom
+    int    n     = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3 ? 1 : 0) + (c4 ? 1 : 0) + (c5 ? 1 : 0)
+    string g     = n >= 4 ? "◎" : n == 3 ? "○" : "✕"
+    string word  = n >= 4 ? "質：高い" : n == 3 ? "質：普通" : "質：低い（見送り寄り）"
+    string roomS = na(room) ? "余地あり" : "余地" + str.tostring(room / pip, "#") + unit
+
+    array<string> ok = array.new<string>()
+    array<string> ng = array.new<string>()
+    if c1
+        ok.push(swept + "の狩り")
+    else
+        ng.push("小さい狩り")
+    if c2
+        ok.push("強い抜け")
+    else
+        ng.push("弱い抜け")
+    if c3
+        ok.push(winNm)
+    else
+        ng.push("時間外")
+    if c4
+        ok.push("1H目線一致")
+    else
+        ng.push("1H目線逆")
+    if c5
+        ok.push(roomS)
+    else
+        ng.push(roomS + "（不足）")
+
+    string txt = g + " " + word + (ok.size() > 0 ? "\n" + ok.join("・") : "") + (ng.size() > 0 ? "\n⚠ " + ng.join("・") : "")
+    color  bg  = g == "◎" ? color.new(color.lime, 0) : g == "○" ? color.new(color.yellow, 0) : color.new(color.gray, 0)
+    bool   show = showWhich == "すべて" or (showWhich == "◎○だけ" and g != "✕") or (showWhich == "◎だけ" and g == "◎")
+    // 既存インジの「🎯」ラベルと重ならないよう、反対側（買い＝足の上、売り＝足の下）に出す
+    if show
+        label.new(bar_index, d == 1 ? high : low, txt, yloc = d == 1 ? yloc.abovebar : yloc.belowbar, style = d == 1 ? label.style_label_down : label.style_label_up, color = bg, textcolor = color.black, size = size.small, text_formatting = text.format_bold)
+    alert(syminfo.ticker + " 5分足：3根拠成立（" + (d == 1 ? "買い" : "売り") + "）" + g + " " + word + "／" + ok.join("・") + (ng.size() > 0 ? "／⚠ " + ng.join("・") : ""), alert.freq_once_per_bar_close)
+
+    lastDir   := d
+    lastBar   := bar_index
+    lastGrade := g + " " + word
+    gradeOut  := d * (g == "◎" ? 3 : g == "○" ? 2 : 1)
+    topBuy    := d == 1 and g == "◎"
+    topSell   := d == -1 and g == "◎"
+
+// ───────────────────────── 表示 ─────────────────────────
+plot(gradeOut, "質の判定（買い+3◎ +2○ +1✕ / 売りはマイナス）", display = display.data_window)
+
+plot(showLevels ? pdh : na,   "前日高値",     color = color.new(color.red, 40),  style = plot.style_linebr)
+plot(showLevels ? pdl : na,   "前日安値",     color = color.new(color.teal, 40), style = plot.style_linebr)
+plot(showLevels ? asiaH : na, "アジア高値",   color = color.new(color.red, 60),  style = plot.style_linebr)
+plot(showLevels ? asiaL : na, "アジア安値",   color = color.new(color.teal, 60), style = plot.style_linebr)
+plot(showLevels ? lonH : na,  "ロンドン高値", color = color.new(color.red, 60),  style = plot.style_linebr)
+plot(showLevels ? lonL : na,  "ロンドン安値", color = color.new(color.teal, 60), style = plot.style_linebr)
+
+alertcondition(topBuy,  "3根拠成立(買い)＋質◎", "{{ticker}} 5分足：3根拠成立（買い）で質◎。最終判断はご自身で。")
+alertcondition(topSell, "3根拠成立(売り)＋質◎", "{{ticker}} 5分足：3根拠成立（売り）で質◎。最終判断はご自身で。")
+
+var table panel = table.new(position.top_right, 1, 1, bgcolor = color.new(color.black, 30))
+if barstate.islast and showLine1
+    int off = barstate.isconfirmed ? 0 : 1
+    string t = lastDir == 0 ? "3根拠Q：まだサインなし" : "3根拠Q：直近 " + (lastDir == 1 ? "買い " : "売り ") + lastGrade + "（" + str.tostring(bar_index - off - lastBar) + "本前）"
+    table.cell(panel, 0, 0, t, text_color = color.white, text_size = size.small)
