@@ -1,0 +1,394 @@
+//@version=6
+// =====================================================================
+// TFX 第4判断 検証用バックテスト（strategy）
+// ---------------------------------------------------------------------
+// 役割：表示用インジケーター（TFX_4th_Context.pine）とは別物。売買判断には使わず、
+//       「既存3根拠に ATR / VWAP / ADX フィルターを足すと成績がどう変わるか」を検証する。
+//
+// ベースシグナルの取得方法（どちらかを選択）：
+//   1) 外部ソース（推奨）… 既存インジケーターの出力系列を input.source で読む。
+//      既存インジケーターのコードは変更しない。系列の値の仕様は要確認（README参照）。
+//   2) 近似ロジック（代替）… LG→BOS＋EMA8/50 の簡易再現。既存システムそのものではない。
+//      結果は「フィルターの相対比較」にのみ使い、既存手法の成績とはみなさないこと。
+//
+// 比較条件（同じベースシグナルに対して並行シミュレーション）：
+//   A 既存のみ / B +ATR / C +VWAP / D +ATR+VWAP / E +ADX（不採用判断の確認用）
+//
+// 約定モデル（内部シミュレーション）：
+//   確定足でシグナル → 次足始値でエントリー。SL/TPはシグナル足終値時点で固定。
+//   始値がSL/TPを越えていれば始値で決済。同一足でSLとTPの両方に触れた場合はSL（保守的）。
+//   取引コスト（スプレッド＋手数料＋スリッページ）は往復で1回、価格単位で差し引く。
+//   TradingView標準のストラテジーテスターは選択した1条件のみを実行する（同足SL/TPの扱いが異なりうる）。
+// =====================================================================
+strategy("TFX 第4判断 検証用バックテスト", shorttitle = "TFX-4th BT", overlay = true, pyramiding = 0, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 0, slippage = 0, process_orders_on_close = false, calc_on_every_tick = false)
+
+// ───────────────────────── Inputs ─────────────────────────
+GRP_SIG = "① ベースシグナル（既存3根拠）"
+sigMode   = input.string("近似ロジック（代替）", "取得方法", options = ["近似ロジック（代替）", "外部ソース（既存インジ）"], group = GRP_SIG)
+extLong   = input.source(close, "外部：LONGシグナル系列", group = GRP_SIG, tooltip = "既存インジのLONGシグナル出力を選択。値が na でも 0 でもない足をシグナルとみなし、立ち上がりのみ採用。")
+extShort  = input.source(close, "外部：SHORTシグナル系列", group = GRP_SIG)
+swingLen  = input.int(3, "近似：スイング確定本数（左右）", minval = 1, group = GRP_SIG, tooltip = "ピボットは右側の本数ぶん遅れて確定する（未来参照なし）。")
+lgWindow  = input.int(12, "近似：LG後にBOSを待つ最大本数", minval = 1, group = GRP_SIG)
+emaFastL  = input.int(8, "近似：EMA短期", minval = 1, group = GRP_SIG)
+emaSlowL  = input.int(50, "近似：EMA中期", minval = 1, group = GRP_SIG)
+
+GRP_EXIT = "② 決済ルール（全条件共通）"
+slMode    = input.string("構造（Sweep極値）", "損切り位置", options = ["構造（Sweep極値）", "ATR倍数", "直近N本の高安"], group = GRP_EXIT, tooltip = "外部ソース時は『構造』が使えないため『直近N本の高安』で代用。")
+slBufATR  = input.float(0.1, "損切りバッファ：ATR ×", minval = 0.0, step = 0.05, group = GRP_EXIT)
+slATRMult = input.float(1.5, "ATR倍数モード：ATR ×", minval = 0.1, step = 0.1, group = GRP_EXIT)
+slLookbk  = input.int(10, "直近N本モード：N", minval = 1, group = GRP_EXIT)
+rrTarget  = input.float(2.0, "利確：リスクの何倍（R）", minval = 0.1, step = 0.1, group = GRP_EXIT)
+
+GRP_COST = "③ 取引コスト（往復・価格単位）"
+costXAU   = input.float(0.30, "XAUUSD（例 0.30 = 30セント）", minval = 0.0, step = 0.01, group = GRP_COST)
+costUS30  = input.float(3.0, "US30（例 3.0ポイント）", minval = 0.0, step = 0.1, group = GRP_COST)
+costOther = input.float(0.0, "その他の銘柄", minval = 0.0, group = GRP_COST)
+
+GRP_F = "④ フィルター設定（インジケーターと同じ定義）"
+atrLen      = input.int(14, "ATR期間", minval = 1, group = GRP_F)
+volLookback = input.int(576, "ATRパーセンタイル参照本数", minval = 50, group = GRP_F)
+lowPct      = input.float(15.0, "低ボラ：パーセンタイル未満", group = GRP_F)
+highPct     = input.float(95.0, "高ボラ：パーセンタイル超", group = GRP_F)
+shockMult   = input.float(3.0, "急変動：TR ≧ 前足ATR ×", step = 0.1, group = GRP_F)
+shockCool   = input.int(3, "急変動後の警戒本数", minval = 0, group = GRP_F)
+useSlSanity = input.bool(true, "B/D：損切り幅のATR比チェック", group = GRP_F)
+minSlATR    = input.float(0.3, "損切り幅の下限：ATR ×", step = 0.05, group = GRP_F)
+maxSlATR    = input.float(3.0, "損切り幅の上限：ATR ×", step = 0.1, group = GRP_F)
+anchorMode  = input.string("指定時刻", "VWAPリセット方法", options = ["指定時刻", "チャートの日足区切り"], group = GRP_F)
+anchorTz    = input.string("America/New_York", "リセット時刻のタイムゾーン", options = ["America/New_York", "Etc/UTC", "Europe/London", "Asia/Tokyo"], group = GRP_F)
+anchorHour  = input.int(18, "リセット時刻（時）", minval = 0, maxval = 23, group = GRP_F)
+anchorMin   = input.int(0, "リセット時刻（分）", minval = 0, maxval = 59, group = GRP_F)
+warmup      = input.int(6, "VWAP形成中の本数", minval = 0, group = GRP_F)
+slopeLen    = input.int(6, "VWAP傾きの計測本数", minval = 1, group = GRP_F)
+slopeThr    = input.float(0.15, "傾きあり：ATR ×", step = 0.05, group = GRP_F)
+posBuf      = input.float(0.10, "VWAP付近の幅：ATR ×", step = 0.05, group = GRP_F)
+slopeRule   = input.string("逆向きでない", "傾き条件", options = ["逆向きでない", "同方向必須"], group = GRP_F)
+useStretch  = input.bool(true, "伸び切りを除外", group = GRP_F)
+stretchThr  = input.float(2.5, "伸び切り：乖離 ≧ ATR ×", step = 0.1, group = GRP_F)
+adxLen      = input.int(14, "E：ADX期間", minval = 1, group = GRP_F)
+adxThr      = input.float(20.0, "E：ADX ≧", step = 1.0, group = GRP_F)
+adxRising   = input.bool(false, "E：ADX上昇中も必須", group = GRP_F)
+
+GRP_T = "⑤ 期間・集計"
+testFrom   = input.time(timestamp("01 Jan 2024 00:00 +0000"), "検証開始", group = GRP_T)
+testTo     = input.time(timestamp("31 Dec 2099 00:00 +0000"), "検証終了", group = GRP_T)
+splitAt    = input.time(timestamp("01 Jan 2026 00:00 +0000"), "IS/OOS 分割日（パラメーター調整はIS側のみで）", group = GRP_T)
+statPeriod = input.string("全期間", "集計する期間", options = ["全期間", "IS（分割日より前）", "OOS（分割日以降）"], group = GRP_T)
+statBucket = input.string("全時間帯", "集計する時間帯（エントリー時刻UTC）", options = ["全時間帯", "東京 00-07", "ロンドン 07-13", "NY 13-21", "その他 21-24"], group = GRP_T)
+tvVariant  = input.string("A 既存のみ", "ストラテジーテスターで実行する条件", options = ["A 既存のみ", "B +ATR", "C +VWAP", "D +ATR+VWAP", "E +ADX"], group = GRP_T)
+showTable  = input.bool(true, "比較テーブルを表示", group = GRP_T)
+showSigs   = input.bool(false, "ベースシグナルを表示", group = GRP_T)
+
+// ───────────────────────── 共通計算 ─────────────────────────
+float atr     = ta.atr(atrLen)
+float atrPrev = atr[1]
+float trNow   = ta.tr(true)
+float atrPct  = ta.percentrank(atr, volLookback)
+bool  volReady = not na(atrPct) and not na(atrPrev) and atrPrev > 0
+bool  volLow   = volReady and atrPct < lowPct
+bool  volHigh  = volReady and atrPct > highPct
+bool  shockBar = volReady and trNow >= shockMult * atrPrev
+int   sinceShk = ta.barssince(shockBar)
+bool  shockAct = not na(sinceShk) and sinceShk <= shockCool
+bool  volOK    = volReady and not volLow and not volHigh and not shockAct
+
+// Session VWAP（インジケーターと同一ロジック）
+int   todayAnchor = timestamp(anchorTz, year(time, anchorTz), month(time, anchorTz), dayofmonth(time, anchorTz), anchorHour, anchorMin, 0)
+int   anchorTs    = time >= todayAnchor ? todayAnchor : todayAnchor - 86400000
+bool  newByTime   = bar_index == 0 or (anchorTs - nz(anchorTs[1]) > 2 * 3600000)
+bool  dayChange   = timeframe.change("D")
+bool  newByDay    = bar_index == 0 or dayChange
+bool  newSession  = anchorMode == "指定時刻" ? newByTime : newByDay
+var float sumPV    = 0.0
+var float sumV     = 0.0
+var int   sessBars = 0
+if newSession
+    sumPV    := 0.0
+    sumV     := 0.0
+    sessBars := 0
+else
+    sessBars += 1
+float vol = nz(volume)
+sumPV += hlc3 * vol
+sumV  += vol
+bool  hasVolume = sumV > 0
+float vwapVal   = hasVolume ? sumPV / sumV : na
+bool  vwapReady = hasVolume and sessBars >= warmup and not na(atr) and atr > 0
+float distATR   = vwapReady ? (close - vwapVal) / atr : na
+float slopeATR  = vwapReady and sessBars >= slopeLen ? (vwapVal - vwapVal[slopeLen]) / atr : na
+bool  vwapJudge = not na(distATR) and not na(slopeATR)
+int   posDir    = na(distATR) ? 0 : distATR > posBuf ? 1 : distATR < -posBuf ? -1 : 0
+int   slopeDir  = na(slopeATR) ? 0 : slopeATR > slopeThr ? 1 : slopeATR < -slopeThr ? -1 : 0
+bool  stretched = not na(distATR) and math.abs(distATR) >= stretchThr
+bool  slopeOkL  = slopeRule == "同方向必須" ? slopeDir == 1 : slopeDir >= 0
+bool  slopeOkS  = slopeRule == "同方向必須" ? slopeDir == -1 : slopeDir <= 0
+bool  vwapLong  = vwapJudge and posDir == 1 and slopeOkL and not (useStretch and stretched)
+bool  vwapShort = vwapJudge and posDir == -1 and slopeOkS and not (useStretch and stretched)
+
+// ADX（比較用・不採用判断の確認）
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+bool adxOK = not na(adx) and adx >= adxThr and (adxRising ? adx > adx[1] : true)
+
+// ───────────────────────── ベースシグナル ─────────────────────────
+// 近似ロジック：確定スイング安値を下ヒゲで割り込み終値で戻す（LG）→ lgWindow本以内に
+//               確定スイング高値を終値で上抜け（BOS）→ EMA短期 > EMA中期 で LONG。SHORTは対称。
+float emaF = ta.ema(close, emaFastL)
+float emaS = ta.ema(close, emaSlowL)
+float ph   = ta.pivothigh(high, swingLen, swingLen)
+float pl   = ta.pivotlow(low, swingLen, swingLen)
+float lowN  = ta.lowest(low, slLookbk)
+float highN = ta.highest(high, slLookbk)
+
+var float swingHigh = na
+var float swingLow  = na
+var bool  shBroken  = false
+var bool  slBroken  = false
+if not na(ph)
+    swingHigh := ph
+    shBroken  := false
+if not na(pl)
+    swingLow := pl
+    slBroken := false
+
+bool lgLong  = not na(swingLow) and low < swingLow and close > swingLow
+bool lgShort = not na(swingHigh) and high > swingHigh and close < swingHigh
+
+var int   lgLBar = na
+var float lgLExt = na
+var int   lgSBar = na
+var float lgSExt = na
+if not na(lgLBar) and bar_index - lgLBar > lgWindow
+    lgLBar := na
+    lgLExt := na
+if not na(lgSBar) and bar_index - lgSBar > lgWindow
+    lgSBar := na
+    lgSExt := na
+if lgLong
+    lgLExt := na(lgLBar) ? low : math.min(lgLExt, low)
+    lgLBar := bar_index
+else if not na(lgLBar)
+    lgLExt := math.min(lgLExt, low)
+if lgShort
+    lgSExt := na(lgSBar) ? high : math.max(lgSExt, high)
+    lgSBar := bar_index
+else if not na(lgSBar)
+    lgSExt := math.max(lgSExt, high)
+
+bool bosUp = not na(swingHigh) and not shBroken and close > swingHigh
+bool bosDn = not na(swingLow) and not slBroken and close < swingLow
+if bosUp
+    shBroken := true
+if bosDn
+    slBroken := true
+
+bool proxyL = bosUp and emaF > emaS and not na(lgLBar)
+bool proxyS = bosDn and emaF < emaS and not na(lgSBar)
+float proxyLExt = lgLExt
+float proxySExt = lgSExt
+if proxyL
+    lgLBar := na
+    lgLExt := na
+if proxyS
+    lgSBar := na
+    lgSExt := na
+
+bool extL  = not na(extLong) and extLong != 0
+bool extS  = not na(extShort) and extShort != 0
+bool extLE = extL and not extL[1]
+bool extSE = extS and not extS[1]
+
+bool isProxy = sigMode == "近似ロジック（代替）"
+bool rawL = isProxy ? proxyL : extLE
+bool rawS = isProxy ? proxyS : extSE
+bool sigL = rawL and not rawS
+bool sigS = rawS and not rawL
+
+// 損切り・利確（シグナル足の終値時点で固定）
+bool  useStruct = isProxy and slMode == "構造（Sweep極値）"
+float buf  = nz(atr) * slBufATR
+float slL  = useStruct ? proxyLExt - buf : slMode == "ATR倍数" ? close - slATRMult * atr : lowN - buf
+float slS  = useStruct ? proxySExt + buf : slMode == "ATR倍数" ? close + slATRMult * atr : highN + buf
+float rkL  = close - slL
+float rkS  = slS - close
+bool  okL  = sigL and not na(slL) and rkL > 0
+bool  okS  = sigS and not na(slS) and rkS > 0
+float tpL  = close + rrTarget * rkL
+float tpS  = close - rrTarget * rkS
+
+bool slSaneL = not useSlSanity or (not na(atr) and atr > 0 and rkL / atr >= minSlATR and rkL / atr <= maxSlATR)
+bool slSaneS = not useSlSanity or (not na(atr) and atr > 0 and rkS / atr >= minSlATR and rkS / atr <= maxSlATR)
+
+bool fAtrL = volOK and slSaneL
+bool fAtrS = volOK and slSaneS
+
+passL(int i) =>
+    switch i
+        0 => true
+        1 => fAtrL
+        2 => vwapLong
+        3 => fAtrL and vwapLong
+        => adxOK
+passS(int i) =>
+    switch i
+        0 => true
+        1 => fAtrS
+        2 => vwapShort
+        3 => fAtrS and vwapShort
+        => adxOK
+
+// ───────────────────────── 並行シミュレーション ─────────────────────────
+type Sim
+    int   dir      = 0
+    float entry    = na
+    float sl       = na
+    float tp       = na
+    int   entryT   = 0
+    int   pendDir  = 0
+    float pendSl   = na
+    float pendTp   = na
+    int   n        = 0
+    int   wins     = 0
+    float sumWin   = 0.0
+    float sumLoss  = 0.0
+    float sumR     = 0.0
+    float sumR2    = 0.0
+    float eqR      = 0.0
+    float peakR    = 0.0
+    float maxDdR   = 0.0
+    int   cl       = 0
+    int   maxCl    = 0
+
+float cost = str.contains(syminfo.ticker, "XAU") ? costXAU : (str.contains(syminfo.ticker, "US30") or str.contains(syminfo.ticker, "DJ") or str.contains(syminfo.ticker, "YM")) ? costUS30 : costOther
+
+bucketOf(int t) =>
+    int h = hour(t, "Etc/UTC")
+    h < 7 ? "東京 00-07" : h < 13 ? "ロンドン 07-13" : h < 21 ? "NY 13-21" : "その他 21-24"
+
+counted(int t) =>
+    bool p = statPeriod == "全期間" or (statPeriod == "IS（分割日より前）" ? t < splitAt : t >= splitAt)
+    bool b = statBucket == "全時間帯" or bucketOf(t) == statBucket
+    p and b
+
+method closeTrade(Sim s, float px, float c) =>
+    float pnl  = (px - s.entry) * s.dir - c
+    float risk = math.abs(s.entry - s.sl)
+    float r    = risk > 0 ? pnl / risk : 0.0
+    if counted(s.entryT)
+        s.n := s.n + 1
+        if pnl > 0
+            s.wins   := s.wins + 1
+            s.sumWin := s.sumWin + pnl
+            s.cl     := 0
+        else
+            s.sumLoss := s.sumLoss - pnl
+            s.cl      := s.cl + 1
+            s.maxCl   := math.max(s.maxCl, s.cl)
+        s.sumR   := s.sumR + r
+        s.sumR2  := s.sumR2 + r * r
+        s.eqR    := s.eqR + r
+        s.peakR  := math.max(s.peakR, s.eqR)
+        s.maxDdR := math.max(s.maxDdR, s.peakR - s.eqR)
+    s.dir   := 0
+    s.entry := na
+
+var array<Sim> sims = array.from(Sim.new(), Sim.new(), Sim.new(), Sim.new(), Sim.new())
+bool inRange = time >= testFrom and time < testTo
+
+for i = 0 to 4
+    Sim s = sims.get(i)
+    // 1) 前足のシグナル → 今足の始値でエントリー
+    if s.pendDir != 0
+        s.dir     := s.pendDir
+        s.entry   := open
+        s.sl      := s.pendSl
+        s.tp      := s.pendTp
+        s.entryT  := time
+        s.pendDir := 0
+    // 2) 決済判定（同足でSL/TP両方なら保守的にSL）
+    if s.dir != 0
+        float px = na
+        if s.dir == 1
+            px := open <= s.sl ? open : open >= s.tp ? open : low <= s.sl ? s.sl : high >= s.tp ? s.tp : na
+        else
+            px := open >= s.sl ? open : open <= s.tp ? open : high >= s.sl ? s.sl : low <= s.tp ? s.tp : na
+        if not na(px)
+            s.closeTrade(px, cost)
+    // 3) 新規シグナル（ノーポジション時のみ）
+    if s.dir == 0 and inRange and barstate.isconfirmed
+        if okL and passL(i)
+            s.pendDir := 1
+            s.pendSl  := slL
+            s.pendTp  := tpL
+        else if okS and passS(i)
+            s.pendDir := -1
+            s.pendSl  := slS
+            s.pendTp  := tpS
+
+// ───────────────────────── TradingView標準エンジン（選択した1条件） ─────────────────────────
+int tvIdx = switch tvVariant
+    "A 既存のみ"   => 0
+    "B +ATR"       => 1
+    "C +VWAP"      => 2
+    "D +ATR+VWAP"  => 3
+    => 4
+bool tvL = okL and passL(tvIdx)
+bool tvS = okS and passS(tvIdx)
+if inRange and strategy.position_size == 0 and barstate.isconfirmed
+    if tvL
+        strategy.entry("L", strategy.long)
+        strategy.exit("LX", from_entry = "L", stop = slL, limit = tpL)
+    else if tvS
+        strategy.entry("S", strategy.short)
+        strategy.exit("SX", from_entry = "S", stop = slS, limit = tpS)
+
+plotshape(showSigs and okL, "ベースLONG", shape.triangleup, location.belowbar, color.new(color.teal, 0), size = size.tiny)
+plotshape(showSigs and okS, "ベースSHORT", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)
+
+// ───────────────────────── 比較テーブル ─────────────────────────
+fmt(float x, string f) =>
+    na(x) ? "-" : str.tostring(x, f)
+
+var table tb = table.new(position.bottom_right, 11, 8, bgcolor = color.new(color.black, 20), border_color = color.new(color.gray, 60), border_width = 1)
+if barstate.islast and showTable
+    table.clear(tb, 0, 0, 10, 7)
+    color ct = color.white
+    array<string> hdr = array.from("条件", "回数", "勝率", "平均利益", "平均損失", "RR", "期待値", "期待値R", "PF", "最大DD(R)", "最大連敗")
+    for c = 0 to 10
+        table.cell(tb, c, 0, hdr.get(c), text_color = ct, text_size = size.tiny)
+    array<string> names = array.from("A 既存のみ", "B +ATR", "C +VWAP", "D +ATR+VWAP", "E +ADX")
+    for i = 0 to 4
+        Sim s = sims.get(i)
+        int    n    = s.n
+        int    loss = n - s.wins
+        float  wr   = n > 0 ? 100.0 * s.wins / n : na
+        float  aw   = s.wins > 0 ? s.sumWin / s.wins : na
+        float  al   = loss > 0 ? s.sumLoss / loss : na
+        float  rr   = not na(aw) and not na(al) and al > 0 ? aw / al : na
+        float  ex   = n > 0 ? (s.sumWin - s.sumLoss) / n : na
+        float  exR  = n > 0 ? s.sumR / n : na
+        float  pf   = s.sumLoss > 0 ? s.sumWin / s.sumLoss : na
+        color  rc   = n < 30 ? color.new(color.gray, 0) : ct
+        table.cell(tb, 0, i + 1, names.get(i), text_color = rc, text_size = size.tiny, text_halign = text.align_left)
+        table.cell(tb, 1, i + 1, str.tostring(n), text_color = rc, text_size = size.tiny)
+        table.cell(tb, 2, i + 1, fmt(wr, "#.#") + "%", text_color = rc, text_size = size.tiny)
+        table.cell(tb, 3, i + 1, fmt(aw, format.mintick), text_color = rc, text_size = size.tiny)
+        table.cell(tb, 4, i + 1, fmt(al, format.mintick), text_color = rc, text_size = size.tiny)
+        table.cell(tb, 5, i + 1, fmt(rr, "#.##"), text_color = rc, text_size = size.tiny)
+        table.cell(tb, 6, i + 1, fmt(ex, format.mintick), text_color = rc, text_size = size.tiny)
+        table.cell(tb, 7, i + 1, fmt(exR, "#.###"), text_color = rc, text_size = size.tiny)
+        table.cell(tb, 8, i + 1, fmt(pf, "#.##"), text_color = rc, text_size = size.tiny)
+        table.cell(tb, 9, i + 1, fmt(s.maxDdR, "#.#"), text_color = rc, text_size = size.tiny)
+        table.cell(tb, 10, i + 1, str.tostring(s.maxCl), text_color = rc, text_size = size.tiny)
+    string note = (isProxy ? "※近似ロジック：既存システムの成績ではない" : "※外部ソース") + " / 期間:" + statPeriod + " / 時間帯:" + statBucket + " / コスト往復:" + str.tostring(cost) + " / 灰色=30回未満"
+    table.cell(tb, 0, 6, note, text_color = color.new(color.yellow, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.merge_cells(tb, 0, 6, 10, 6)
+    // 期待値R の t値（平均R ÷ 標準誤差）。2未満は偶然と区別しにくい目安
+    string tline = "期待値Rのt値: "
+    for i = 0 to 4
+        Sim s = sims.get(i)
+        float m  = s.n > 1 ? s.sumR / s.n : na
+        float sd = s.n > 1 ? math.sqrt(math.max(s.sumR2 / s.n - m * m, 0.0) * s.n / (s.n - 1)) : na
+        float t  = not na(sd) and sd > 0 ? m / (sd / math.sqrt(s.n)) : na
+        tline += str.substring(names.get(i), 0, 1) + "=" + fmt(t, "#.##") + "  "
+    table.cell(tb, 0, 7, tline + "（|t|<2 は偶然と区別しにくい）", text_color = color.new(color.silver, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.merge_cells(tb, 0, 7, 10, 7)

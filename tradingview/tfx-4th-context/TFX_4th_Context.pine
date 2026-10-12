@@ -1,0 +1,245 @@
+//@version=6
+// =====================================================================
+// TFX 第4判断：環境フィルター（ATR × Session VWAP）
+// ---------------------------------------------------------------------
+// ・既存インジケーター（Liquidity Grab / EMA 8・50 / BOS）とは完全に独立した別スクリプト。
+//   既存スクリプトの変数・ロジック・シグナルを一切参照しない（単独で動作）。
+// ・本ツールは「エントリーシグナル」を出さない。表示する LONG候補 / SHORT候補 / WAIT は
+//   「その方向の相場環境（ボラ・VWAP位置）が揃っているか」の補助評価であり、
+//   既存3根拠の成立とは無関係。
+// ・判定はすべて確定足ベース。リアルタイム（未確定）足ではパネルは直前の確定足の値を表示する。
+// ・request.security 不使用（上位足の先読み・リペイント要因なし）。ピボット不使用（確定遅延なし）。
+// ・しきい値はすべて「検証用の初期値」であり、最適化済みの値ではない。
+// =====================================================================
+indicator("TFX 第4判断：環境フィルター (ATR × VWAP)", shorttitle = "TFX-4th Ctx", overlay = true)
+
+// ───────────────────────── Inputs ─────────────────────────
+GRP_VOL  = "① ATR：ボラティリティ"
+useVol      = input.bool(true, "ATRボラ判定を総合判定に使う", group = GRP_VOL)
+atrLen      = input.int(14, "ATR期間", minval = 1, group = GRP_VOL)
+volLookback = input.int(576, "ATRパーセンタイルの参照本数（5分足576本 ≒ 2日）", minval = 50, group = GRP_VOL)
+lowPct      = input.float(15.0, "低ボラ：パーセンタイル未満", minval = 0, maxval = 100, group = GRP_VOL)
+highPct     = input.float(95.0, "高ボラ：パーセンタイル超", minval = 0, maxval = 100, group = GRP_VOL)
+useShock    = input.bool(true, "急変動足を検出する", group = GRP_VOL)
+shockMult   = input.float(3.0, "急変動：TR ≧ 前足ATR ×", minval = 1.0, step = 0.1, group = GRP_VOL)
+shockCool   = input.int(3, "急変動後の警戒本数", minval = 0, group = GRP_VOL)
+strongBody  = input.float(0.8, "直近足『強い』：実体 ≧ 前足ATR ×", minval = 0.1, step = 0.1, group = GRP_VOL)
+plannedSL   = input.float(0.0, "想定損切り幅（価格単位・0で非表示）", minval = 0.0, group = GRP_VOL)
+
+GRP_VWAP = "② Session VWAP"
+useVwap     = input.bool(true, "VWAP判定を総合判定に使う", group = GRP_VWAP)
+anchorMode  = input.string("指定時刻", "VWAPリセット方法", options = ["指定時刻", "チャートの日足区切り"], group = GRP_VWAP)
+anchorTz    = input.string("America/New_York", "リセット時刻のタイムゾーン", options = ["America/New_York", "Etc/UTC", "Europe/London", "Asia/Tokyo"], group = GRP_VWAP)
+anchorHour  = input.int(18, "リセット時刻（時）", minval = 0, maxval = 23, group = GRP_VWAP)
+anchorMin   = input.int(0, "リセット時刻（分）", minval = 0, maxval = 59, group = GRP_VWAP)
+warmup      = input.int(6, "セッション開始後『形成中』とする本数", minval = 0, group = GRP_VWAP)
+slopeLen    = input.int(6, "VWAP傾きの計測本数", minval = 1, group = GRP_VWAP)
+slopeThr    = input.float(0.15, "傾きあり：変化量 ≧ ATR ×", minval = 0.0, step = 0.05, group = GRP_VWAP)
+posBuf      = input.float(0.10, "『VWAP付近』とみなす幅：ATR ×", minval = 0.0, step = 0.05, group = GRP_VWAP)
+slopeRule   = input.string("逆向きでない", "傾き条件", options = ["逆向きでない", "同方向必須"], group = GRP_VWAP)
+useStretch  = input.bool(true, "VWAPからの伸び切りを総合判定に使う", group = GRP_VWAP)
+stretchThr  = input.float(2.5, "伸び切り：乖離 ≧ ATR ×", minval = 0.1, step = 0.1, group = GRP_VWAP)
+
+GRP_DISP = "③ 表示"
+showVwap   = input.bool(true, "VWAPラインを表示", group = GRP_DISP)
+showPanel  = input.bool(true, "パネルを表示", group = GRP_DISP)
+showDetail = input.bool(true, "詳細パネル（OFFで総合判定のみ）", group = GRP_DISP)
+panelPos   = input.string("右上", "パネル位置", options = ["右上", "右下", "左上", "左下"], group = GRP_DISP)
+panelSize  = input.string("小", "文字サイズ", options = ["極小", "小", "標準"], group = GRP_DISP)
+showMarks  = input.bool(false, "状態変化マーカー（チャート最下部）", group = GRP_DISP)
+showBg     = input.bool(false, "背景色で状態を表示", group = GRP_DISP)
+
+// ───────────────────────── ① ATR ─────────────────────────
+float atr     = ta.atr(atrLen)
+float atrPrev = atr[1]
+float trNow   = ta.tr(true)
+float atrPct  = ta.percentrank(atr, volLookback)
+
+bool volReady  = not na(atrPct) and not na(atrPrev) and atrPrev > 0
+bool volLow    = volReady and atrPct < lowPct
+bool volHigh   = volReady and atrPct > highPct
+bool shockBar  = useShock and volReady and trNow >= shockMult * atrPrev
+int  sinceShk  = ta.barssince(shockBar)
+bool shockAct  = useShock and not na(sinceShk) and sinceShk <= shockCool
+bool volOK     = volReady and not volLow and not volHigh and not shockAct
+
+float bodyATR  = volReady ? math.abs(close - open) / atrPrev : na
+bool  strong   = not na(bodyATR) and bodyATR >= strongBody
+
+// ───────────────────────── ② Session VWAP ─────────────────────────
+// 指定時刻モード：直近のリセット時刻（タイムゾーン考慮・夏時間対応）が変わった足で新セッション。
+// 夏時間切替日に生じる1時間のズレで誤リセットしないよう、2時間超の変化のみ新セッションとする。
+int   todayAnchor = timestamp(anchorTz, year(time, anchorTz), month(time, anchorTz), dayofmonth(time, anchorTz), anchorHour, anchorMin, 0)
+int   anchorTs    = time >= todayAnchor ? todayAnchor : todayAnchor - 86400000
+bool  newByTime   = bar_index == 0 or (anchorTs - nz(anchorTs[1]) > 2 * 3600000)
+bool  dayChange   = timeframe.change("D")
+bool  newByDay    = bar_index == 0 or dayChange
+bool  newSession  = anchorMode == "指定時刻" ? newByTime : newByDay
+
+var float sumPV    = 0.0
+var float sumV     = 0.0
+var int   sessBars = 0
+if newSession
+    sumPV    := 0.0
+    sumV     := 0.0
+    sessBars := 0
+else
+    sessBars += 1
+float vol = nz(volume)
+sumPV += hlc3 * vol
+sumV  += vol
+
+bool  hasVolume = sumV > 0
+float vwapVal   = hasVolume ? sumPV / sumV : na
+bool  vwapReady = hasVolume and sessBars >= warmup and not na(atr) and atr > 0
+float distATR   = vwapReady ? (close - vwapVal) / atr : na
+float slopeATR  = vwapReady and sessBars >= slopeLen ? (vwapVal - vwapVal[slopeLen]) / atr : na
+bool  vwapJudge = not na(distATR) and not na(slopeATR)
+
+int  posDir    = na(distATR) ? 0 : distATR > posBuf ? 1 : distATR < -posBuf ? -1 : 0
+int  slopeDir  = na(slopeATR) ? 0 : slopeATR > slopeThr ? 1 : slopeATR < -slopeThr ? -1 : 0
+bool stretched = not na(distATR) and math.abs(distATR) >= stretchThr
+
+bool slopeOkL  = slopeRule == "同方向必須" ? slopeDir == 1 : slopeDir >= 0
+bool slopeOkS  = slopeRule == "同方向必須" ? slopeDir == -1 : slopeDir <= 0
+bool vwapLong  = vwapJudge and posDir == 1 and slopeOkL and not (useStretch and stretched)
+bool vwapShort = vwapJudge and posDir == -1 and slopeOkS and not (useStretch and stretched)
+
+// ───────────────────────── 総合判定 ─────────────────────────
+// state:  1 = LONG候補（環境）  -1 = SHORT候補（環境）  0 = WAIT  2 = 環境OK（VWAP判定OFFのため方向判定なし）
+bool envVolOK = useVol ? volOK : true
+int    state  = 0
+string reason = ""
+if not envVolOK
+    state  := 0
+    reason := not volReady ? "ATR計算中" : shockAct ? "急変動直後" : volHigh ? "高ボラ（急変動警戒）" : "低ボラ（値動き不足）"
+else if useVwap
+    if not vwapJudge
+        state  := 0
+        reason := not hasVolume ? "出来高データなし（VWAP不可）" : "VWAP形成中"
+    else if vwapLong
+        state  := 1
+        reason := "ボラ適正・VWAP上側"
+    else if vwapShort
+        state  := -1
+        reason := "ボラ適正・VWAP下側"
+    else
+        state  := 0
+        reason := useStretch and stretched ? "VWAPから伸び切り" : posDir == 0 ? "VWAP付近（方向不明瞭）" : "VWAP位置と傾きが不一致"
+else
+    state  := 2
+    reason := "ボラ適正（方向は既存根拠で判断）"
+
+// 確定足のみで状態変化を判定（未確定足では発火しない）
+bool chgLong  = barstate.isconfirmed and state == 1 and state[1] != 1
+bool chgShort = barstate.isconfirmed and state == -1 and state[1] != -1
+bool chgWait  = barstate.isconfirmed and state == 0 and state[1] != 0
+bool newShock = barstate.isconfirmed and shockBar
+
+// ───────────────────────── 描画 ─────────────────────────
+color cUp   = color.new(color.teal, 0)
+color cDn   = color.new(color.red, 0)
+color cFlat = color.new(color.gray, 0)
+color vwapColor = slopeDir == 1 ? cUp : slopeDir == -1 ? cDn : cFlat
+plot(showVwap and not newSession ? vwapVal : na, "Session VWAP", color = vwapColor, linewidth = 2, style = plot.style_linebr)
+
+plotshape(showMarks and chgLong,  "LONG候補へ変化",  shape.triangleup,   location.bottom, cUp,   size = size.tiny)
+plotshape(showMarks and chgShort, "SHORT候補へ変化", shape.triangledown, location.bottom, cDn,   size = size.tiny)
+plotshape(showMarks and chgWait,  "WAITへ変化",      shape.circle,       location.bottom, cFlat, size = size.tiny)
+
+bgcolor(showBg and barstate.isconfirmed ? (state == 1 ? color.new(color.teal, 93) : state == -1 ? color.new(color.red, 93) : na) : na, title = "状態背景")
+
+// データウィンドウ出力（他スクリプトから input.source で参照・検証用）
+plot(state,    "環境状態 (+1/-1/0/2)", display = display.data_window)
+plot(atrPct,   "ATRパーセンタイル",     display = display.data_window)
+plot(bodyATR,  "直近足 実体/ATR",       display = display.data_window)
+plot(distATR,  "VWAP乖離 (ATR比)",      display = display.data_window)
+plot(slopeATR, "VWAP傾き (ATR比)",      display = display.data_window)
+
+// ───────────────────────── アラート（確定足のみ） ─────────────────────────
+alertcondition(chgLong,  "TFX-4th: LONG候補（環境）に変化",  "{{ticker}} 5m: 第4判断がLONG候補（環境）に変化。既存3根拠のシグナルではありません。")
+alertcondition(chgShort, "TFX-4th: SHORT候補（環境）に変化", "{{ticker}} 5m: 第4判断がSHORT候補（環境）に変化。既存3根拠のシグナルではありません。")
+alertcondition(chgWait,  "TFX-4th: WAITに変化",              "{{ticker}} 5m: 第4判断がWAITに変化。")
+alertcondition(newShock, "TFX-4th: 急変動足を検出",          "{{ticker}} 5m: 急変動足（TRがATR倍率を超過）。エントリー警戒。")
+
+// ───────────────────────── パネル ─────────────────────────
+// 未確定足ではひとつ前（確定足）の値を表示する
+int off = barstate.isconfirmed ? 0 : 1
+
+pnlPos(string p) =>
+    switch p
+        "右上" => position.top_right
+        "右下" => position.bottom_right
+        "左上" => position.top_left
+        => position.bottom_left
+
+txtSize(string s) =>
+    switch s
+        "極小" => size.tiny
+        "標準" => size.normal
+        => size.small
+
+fmt(float x) =>
+    na(x) ? "-" : str.tostring(x, "#.##")
+
+mark(bool ok) =>
+    ok ? "✓" : "✗"
+
+var table panel = table.new(pnlPos(panelPos), 2, 10, bgcolor = color.new(color.black, 25), border_color = color.new(color.gray, 60), border_width = 1)
+
+if barstate.islast and showPanel
+    table.clear(panel, 0, 0, 1, 9)
+    ts       = txtSize(panelSize)
+    cTxt     = color.white
+    cOk      = color.new(color.lime, 0)
+    cNg      = color.new(color.orange, 0)
+
+    int    s  = state[off]
+    string rs = reason[off]
+    string stTxt = s == 1 ? "LONG候補（環境）" : s == -1 ? "SHORT候補（環境）" : s == 2 ? "環境OK" : "WAIT"
+    color  stBg  = s == 1 ? color.new(color.teal, 20) : s == -1 ? color.new(color.red, 20) : s == 2 ? color.new(color.blue, 30) : color.new(color.gray, 30)
+
+    table.cell(panel, 0, 0, "第4判断（環境）", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 1, 0, "※既存シグナルではない", text_color = color.new(color.silver, 0), text_size = ts, text_halign = text.align_right)
+    table.cell(panel, 0, 1, stTxt, text_color = cTxt, bgcolor = stBg, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 1, 1, rs, text_color = cTxt, bgcolor = stBg, text_size = ts, text_halign = text.align_left)
+
+    if showDetail
+        // ATR
+        bool   vOk  = volOK[off]
+        string vTxt = not volReady[off] ? "計算中" : shockAct[off] ? "急変動直後" : volHigh[off] ? "高ボラ" : volLow[off] ? "低ボラ" : "通常"
+        table.cell(panel, 0, 2, "ボラ(ATR) " + mark(vOk), text_color = vOk ? cOk : cNg, text_size = ts, text_halign = text.align_left)
+        table.cell(panel, 1, 2, vTxt + "（" + fmt(atrPct[off]) + "%ile）" + (useVol ? "" : " ※判定OFF"), text_color = cTxt, text_size = ts, text_halign = text.align_left)
+
+        float a = atr[off]
+        string slTxt = ""
+        if plannedSL > 0 and not na(a) and a > 0
+            float r = plannedSL / a
+            slTxt := " / 想定SL " + fmt(r) + "ATR" + (r < 0.5 ? "（ノイズ内の恐れ）" : r > 2.0 ? "（広め）" : "")
+        table.cell(panel, 0, 3, "1 ATR", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+        table.cell(panel, 1, 3, (na(a) ? "-" : str.tostring(a, format.mintick)) + slTxt, text_color = cTxt, text_size = ts, text_halign = text.align_left)
+
+        float b    = bodyATR[off]
+        bool  bUp  = close[off] >= open[off]
+        table.cell(panel, 0, 4, "直近確定足", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+        table.cell(panel, 1, 4, (bUp ? "陽線" : "陰線") + " 実体 " + fmt(b) + "ATR" + (strong[off] ? "（強い）" : "（弱い）"), text_color = strong[off] ? cOk : cTxt, text_size = ts, text_halign = text.align_left)
+
+        // VWAP
+        if not hasVolume[off]
+            table.cell(panel, 0, 5, "VWAP", text_color = cNg, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 1, 5, "出来高データなし", text_color = cNg, text_size = ts, text_halign = text.align_left)
+        else
+            int    p    = posDir[off]
+            int    sl   = slopeDir[off]
+            bool   judg = vwapJudge[off]
+            string pTxt = not judg ? "形成中" : p == 1 ? "上側" : p == -1 ? "下側" : "付近"
+            string sTxt = not judg ? "形成中" : sl == 1 ? "上向き" : sl == -1 ? "下向き" : "横ばい"
+            table.cell(panel, 0, 5, "VWAP位置", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 1, 5, pTxt + "（" + fmt(distATR[off]) + "ATR）" + (useVwap ? "" : " ※判定OFF"), text_color = p == 1 ? cUp : p == -1 ? cDn : cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 0, 6, "VWAP傾き", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 1, 6, sTxt + "（" + fmt(slopeATR[off]) + "ATR/" + str.tostring(slopeLen) + "本）", text_color = sl == 1 ? cUp : sl == -1 ? cDn : cTxt, text_size = ts, text_halign = text.align_left)
+            bool st = stretched[off]
+            table.cell(panel, 0, 7, "VWAP乖離", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 1, 7, st ? "伸び切り警戒" : "通常範囲", text_color = st ? cNg : cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 0, 8, "セッション", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 1, 8, str.tostring(sessBars[off] + 1) + "本目（" + (anchorMode == "指定時刻" ? str.format("{0,number,00}:{1,number,00} {2}", anchorHour, anchorMin, anchorTz) : "日足区切り") + "）", text_color = cTxt, text_size = ts, text_halign = text.align_left)
