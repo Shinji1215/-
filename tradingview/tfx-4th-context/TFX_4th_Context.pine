@@ -1,55 +1,60 @@
 //@version=6
 // =====================================================================
-// TFX 第4判断：環境フィルター（ATR × Session VWAP）
+// TFX 第4判断：環境フィルター（ATR × Session VWAP）＋ 5分足BOSの環境評価
 // ---------------------------------------------------------------------
 // ・既存インジケーター（Liquidity Grab / EMA 8・50 / BOS）とは完全に独立した別スクリプト。
 //   既存スクリプトの変数・ロジック・シグナルを一切参照しない（単独で動作）。
-// ・本ツールは「エントリーシグナル」を出さない。表示する LONG候補 / SHORT候補 / WAIT は
-//   「その方向の相場環境（ボラ・VWAP位置）が揃っているか」の補助評価であり、
-//   既存3根拠の成立とは無関係。
+// ・本ツールは「エントリーシグナル」を出さない。表示する 買い向き / 売り向き / 様子見 は
+//   「その方向の相場環境（ボラ・VWAP位置）が揃っているか」の補助評価。
+// ・BOSラベルは本ツール独自の定義（確定スイングを終値で更新）で、既存インジのBOSと
+//   一致するとは限らない。ラベルの◎○△✕は「そのBOS足の時点の環境評価」。
 // ・判定はすべて確定足ベース。リアルタイム（未確定）足ではパネルは直前の確定足の値を表示する。
-// ・request.security 不使用（上位足の先読み・リペイント要因なし）。ピボット不使用（確定遅延なし）。
+// ・request.security 不使用。スイングは右側 swingLen 本の確定を待つ（未来参照なし・遅延あり）。
 // ・しきい値はすべて「検証用の初期値」であり、最適化済みの値ではない。
 // =====================================================================
-indicator("TFX 第4判断：環境フィルター (ATR × VWAP)", shorttitle = "TFX-4th Ctx", overlay = true)
+indicator("TFX 第4判断：環境フィルター (ATR × VWAP)", shorttitle = "TFX-4th Ctx", overlay = true, max_labels_count = 200)
 
 // ───────────────────────── Inputs ─────────────────────────
-GRP_VOL  = "① ATR：ボラティリティ"
-useVol      = input.bool(true, "ATRボラ判定を総合判定に使う", group = GRP_VOL)
-atrLen      = input.int(14, "ATR期間", minval = 1, group = GRP_VOL)
-volLookback = input.int(576, "ATRパーセンタイルの参照本数（5分足576本 ≒ 2日）", minval = 50, group = GRP_VOL)
-lowPct      = input.float(15.0, "低ボラ：パーセンタイル未満", minval = 0, maxval = 100, group = GRP_VOL)
-highPct     = input.float(95.0, "高ボラ：パーセンタイル超", minval = 0, maxval = 100, group = GRP_VOL)
-useShock    = input.bool(true, "急変動足を検出する", group = GRP_VOL)
-shockMult   = input.float(3.0, "急変動：TR ≧ 前足ATR ×", minval = 1.0, step = 0.1, group = GRP_VOL)
-shockCool   = input.int(3, "急変動後の警戒本数", minval = 0, group = GRP_VOL)
-strongBody  = input.float(0.8, "直近足『強い』：実体 ≧ 前足ATR ×", minval = 0.1, step = 0.1, group = GRP_VOL)
-plannedSL   = input.float(0.0, "想定損切り幅（価格単位・0で非表示）", minval = 0.0, group = GRP_VOL)
-
-GRP_VWAP = "② Session VWAP"
-useVwap     = input.bool(true, "VWAP判定を総合判定に使う", group = GRP_VWAP)
-anchorMode  = input.string("指定時刻", "VWAPリセット方法", options = ["指定時刻", "チャートの日足区切り"], group = GRP_VWAP)
-anchorTz    = input.string("America/New_York", "リセット時刻のタイムゾーン", options = ["America/New_York", "Etc/UTC", "Europe/London", "Asia/Tokyo"], group = GRP_VWAP)
-anchorHour  = input.int(18, "リセット時刻（時）", minval = 0, maxval = 23, group = GRP_VWAP)
-anchorMin   = input.int(0, "リセット時刻（分）", minval = 0, maxval = 59, group = GRP_VWAP)
-warmup      = input.int(6, "セッション開始後『形成中』とする本数", minval = 0, group = GRP_VWAP)
-slopeLen    = input.int(6, "VWAP傾きの計測本数", minval = 1, group = GRP_VWAP)
-slopeThr    = input.float(0.15, "傾きあり：変化量 ≧ ATR ×", minval = 0.0, step = 0.05, group = GRP_VWAP)
-posBuf      = input.float(0.10, "『VWAP付近』とみなす幅：ATR ×", minval = 0.0, step = 0.05, group = GRP_VWAP)
-slopeRule   = input.string("逆向きでない", "傾き条件", options = ["逆向きでない", "同方向必須"], group = GRP_VWAP)
-useStretch  = input.bool(true, "VWAPからの伸び切りを総合判定に使う", group = GRP_VWAP)
-stretchThr  = input.float(2.5, "伸び切り：乖離 ≧ ATR ×", minval = 0.1, step = 0.1, group = GRP_VWAP)
-
-GRP_DISP = "③ 表示"
-showVwap   = input.bool(true, "VWAPラインを表示", group = GRP_DISP)
-showPanel  = input.bool(true, "パネルを表示", group = GRP_DISP)
-showDetail = input.bool(true, "詳細パネル（OFFで総合判定のみ）", group = GRP_DISP)
+GRP_DISP = "① 表示"
+viewMode   = input.string("かんたん", "パネルの表示", options = ["かんたん", "くわしく（数字あり）", "非表示"], group = GRP_DISP)
 panelPos   = input.string("右上", "パネル位置", options = ["右上", "右下", "左上", "左下"], group = GRP_DISP)
 panelSize  = input.string("小", "文字サイズ", options = ["極小", "小", "標準"], group = GRP_DISP)
+showVwap   = input.bool(true, "VWAPライン（今日の平均値段）を表示", group = GRP_DISP)
 showMarks  = input.bool(false, "状態変化マーカー（チャート最下部）", group = GRP_DISP)
 showBg     = input.bool(false, "背景色で状態を表示", group = GRP_DISP)
 
-// ───────────────────────── ① ATR ─────────────────────────
+GRP_BOS = "② 5分足BOS"
+showBos    = input.bool(true, "BOSラベルを表示", group = GRP_BOS)
+bosOnlyOk  = input.bool(false, "◎○（環境一致）のBOSだけ表示", group = GRP_BOS)
+swingLen   = input.int(3, "スイング確定本数（左右）", minval = 1, group = GRP_BOS, tooltip = "高値・安値は右側にこの本数が出るまで確定しません（その分の遅れあり・後から書き換わらない）。")
+
+GRP_VOL  = "③ ATR：値動きの大きさ"
+useVol      = input.bool(true, "値動きの判定を使う", group = GRP_VOL)
+atrLen      = input.int(14, "ATR期間", minval = 1, group = GRP_VOL)
+volLookback = input.int(576, "比較する本数（5分足576本 ≒ 2日）", minval = 50, group = GRP_VOL)
+lowPct      = input.float(15.0, "動きが小さい：順位（%ile）未満", minval = 0, maxval = 100, group = GRP_VOL)
+highPct     = input.float(95.0, "動きが荒い：順位（%ile）超", minval = 0, maxval = 100, group = GRP_VOL)
+useShock    = input.bool(true, "急変動足を検出する", group = GRP_VOL)
+shockMult   = input.float(3.0, "急変動：1本の値幅 ≧ ATR ×", minval = 1.0, step = 0.1, group = GRP_VOL)
+shockCool   = input.int(3, "急変動後に待つ本数", minval = 0, group = GRP_VOL)
+strongBody  = input.float(0.8, "勢いが強い足：実体 ≧ ATR ×", minval = 0.1, step = 0.1, group = GRP_VOL)
+plannedSL   = input.float(0.0, "想定損切り幅（価格・0で非表示）", minval = 0.0, group = GRP_VOL)
+
+GRP_VWAP = "④ VWAP：今日の平均値段"
+useVwap     = input.bool(true, "VWAPの判定を使う", group = GRP_VWAP)
+anchorMode  = input.string("指定時刻", "リセット方法", options = ["指定時刻", "チャートの日足区切り"], group = GRP_VWAP)
+anchorTz    = input.string("America/New_York", "タイムゾーン", options = ["America/New_York", "Etc/UTC", "Europe/London", "Asia/Tokyo"], group = GRP_VWAP)
+anchorHour  = input.int(18, "リセット時刻（時）", minval = 0, maxval = 23, group = GRP_VWAP)
+anchorMin   = input.int(0, "リセット時刻（分）", minval = 0, maxval = 59, group = GRP_VWAP)
+warmup      = input.int(6, "リセット後『作成中』とする本数", minval = 0, group = GRP_VWAP)
+slopeLen    = input.int(6, "傾きを測る本数", minval = 1, group = GRP_VWAP)
+slopeThr    = input.float(0.15, "傾きあり：変化 ≧ ATR ×", minval = 0.0, step = 0.05, group = GRP_VWAP)
+posBuf      = input.float(0.10, "『平均線の近く』の幅：ATR ×", minval = 0.0, step = 0.05, group = GRP_VWAP)
+slopeRule   = input.string("逆向きでない", "傾き条件", options = ["逆向きでない", "同方向必須"], group = GRP_VWAP)
+useStretch  = input.bool(true, "伸び切りを様子見にする", group = GRP_VWAP)
+stretchThr  = input.float(2.5, "伸び切り：離れ ≧ ATR ×", minval = 0.1, step = 0.1, group = GRP_VWAP)
+
+// ───────────────────────── ATR ─────────────────────────
 float atr     = ta.atr(atrLen)
 float atrPrev = atr[1]
 float trNow   = ta.tr(true)
@@ -66,7 +71,7 @@ bool volOK     = volReady and not volLow and not volHigh and not shockAct
 float bodyATR  = volReady ? math.abs(close - open) / atrPrev : na
 bool  strong   = not na(bodyATR) and bodyATR >= strongBody
 
-// ───────────────────────── ② Session VWAP ─────────────────────────
+// ───────────────────────── Session VWAP ─────────────────────────
 // 指定時刻モード：直近のリセット時刻（タイムゾーン考慮・夏時間対応）が変わった足で新セッション。
 // 夏時間切替日に生じる1時間のズレで誤リセットしないよう、2時間超の変化のみ新セッションとする。
 int   todayAnchor = timestamp(anchorTz, year(time, anchorTz), month(time, anchorTz), dayofmonth(time, anchorTz), anchorHour, anchorMin, 0)
@@ -106,29 +111,55 @@ bool vwapLong  = vwapJudge and posDir == 1 and slopeOkL and not (useStretch and 
 bool vwapShort = vwapJudge and posDir == -1 and slopeOkS and not (useStretch and stretched)
 
 // ───────────────────────── 総合判定 ─────────────────────────
-// state:  1 = LONG候補（環境）  -1 = SHORT候補（環境）  0 = WAIT  2 = 環境OK（VWAP判定OFFのため方向判定なし）
+// state:  1 = 買い向き  -1 = 売り向き  0 = 様子見  2 = 環境OK（VWAP判定OFFのため方向なし）
+// why    : かんたん表示の理由（初心者向けの言葉）
+// whyS   : BOSラベル用の短い理由
 bool envVolOK = useVol ? volOK : true
-int    state  = 0
-string reason = ""
+int    state = 0
+string why   = ""
+string whyS  = ""
 if not envVolOK
-    state  := 0
-    reason := not volReady ? "ATR計算中" : shockAct ? "急変動直後" : volHigh ? "高ボラ（急変動警戒）" : "低ボラ（値動き不足）"
+    state := 0
+    if not volReady
+        why  := "準備中（データ不足）"
+        whyS := "準備中"
+    else if shockAct
+        why  := "急に大きく動いた直後。少し待つ"
+        whyS := "急変動後"
+    else if volHigh
+        why  := "値動きが荒い。注意"
+        whyS := "荒い"
+    else
+        why  := "動きが小さい。待つ"
+        whyS := "動き小"
 else if useVwap
     if not vwapJudge
-        state  := 0
-        reason := not hasVolume ? "出来高データなし（VWAP不可）" : "VWAP形成中"
+        state := 0
+        why   := not hasVolume ? "出来高データなし" : "今日の平均線を作成中"
+        whyS  := not hasVolume ? "出来高なし" : "作成中"
     else if vwapLong
-        state  := 1
-        reason := "ボラ適正・VWAP上側"
+        state := 1
+        why   := "平均より上・上向き"
+        whyS  := "流れ一致"
     else if vwapShort
-        state  := -1
-        reason := "ボラ適正・VWAP下側"
+        state := -1
+        why   := "平均より下・下向き"
+        whyS  := "流れ一致"
     else
-        state  := 0
-        reason := useStretch and stretched ? "VWAPから伸び切り" : posDir == 0 ? "VWAP付近（方向不明瞭）" : "VWAP位置と傾きが不一致"
+        state := 0
+        if useStretch and stretched
+            why  := posDir > 0 ? "上がりすぎ。押しを待つ" : "下がりすぎ。戻りを待つ"
+            whyS := "伸び切り"
+        else if posDir == 0
+            why  := "平均線の近く。方向待ち"
+            whyS := "方向待ち"
+        else
+            why  := "流れがはっきりしない"
+            whyS := "方向不明"
 else
-    state  := 2
-    reason := "ボラ適正（方向は既存根拠で判断）"
+    state := 2
+    why   := "値動きOK（方向は3根拠で）"
+    whyS  := "環境OK"
 
 // 確定足のみで状態変化を判定（未確定足では発火しない）
 bool chgLong  = barstate.isconfirmed and state == 1 and state[1] != 1
@@ -136,31 +167,92 @@ bool chgShort = barstate.isconfirmed and state == -1 and state[1] != -1
 bool chgWait  = barstate.isconfirmed and state == 0 and state[1] != 0
 bool newShock = barstate.isconfirmed and shockBar
 
+// ───────────────────────── 5分足BOS（本ツール独自の定義） ─────────────────────────
+// 確定したスイング高値（安値）を、終値で初めて上抜け（下抜け）た足を BOS とする。
+// 同じスイングでのBOSは1回だけ。新しいスイングが確定すると再び判定対象になる。
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+var float swingHigh = na
+var float swingLow  = na
+var bool  shBroken  = false
+var bool  slBroken  = false
+if not na(ph)
+    swingHigh := ph
+    shBroken  := false
+if not na(pl)
+    swingLow := pl
+    slBroken := false
+bool bosUp = not na(swingHigh) and not shBroken and close > swingHigh
+bool bosDn = not na(swingLow) and not slBroken and close < swingLow
+if bosUp
+    shBroken := true
+if bosDn
+    slBroken := true
+
+// BOSの評価：◎ 環境が同じ向き＋勢い強 / ○ 環境が同じ向き / △ 様子見の環境 / ✕ 環境が逆向き
+gradeOf(int dir) =>
+    state == 2 ? (strong ? "◎" : "○") : state == dir ? (strong ? "◎" : "○") : state == -dir ? "✕" : "△"
+noteOf(int dir) =>
+    string g = gradeOf(dir)
+    g == "◎" ? (state == 2 ? "環境OK・勢い強" : "流れ一致・勢い強") : g == "○" ? (state == 2 ? "環境OK" : "流れ一致") : g == "✕" ? "流れと逆" : whyS
+gradeColor(string g) =>
+    g == "◎" ? color.new(color.lime, 0) : g == "○" ? color.new(color.teal, 0) : g == "✕" ? color.new(color.orange, 0) : color.new(color.gray, 0)
+
+string gUp = gradeOf(1)
+string gDn = gradeOf(-1)
+bool okUp  = gUp == "◎" or gUp == "○"
+bool okDn  = gDn == "◎" or gDn == "○"
+
+var int    lastBosDir   = 0
+var int    lastBosBar   = na
+var string lastBosGrade = ""
+var string lastBosNote  = ""
+if barstate.isconfirmed
+    if bosUp
+        lastBosDir   := 1
+        lastBosBar   := bar_index
+        lastBosGrade := gUp
+        lastBosNote  := noteOf(1)
+        if showBos and (not bosOnlyOk or okUp)
+            label.new(bar_index, low, "BOS↑ " + gUp + "\n" + noteOf(1), style = label.style_label_up, yloc = yloc.belowbar, color = gradeColor(gUp), textcolor = color.black, size = size.small, text_formatting = text.format_bold)
+        alert(syminfo.ticker + " 5分足 BOS↑ " + gUp + "（" + noteOf(1) + "）※売買サインではありません", alert.freq_once_per_bar_close)
+    if bosDn
+        lastBosDir   := -1
+        lastBosBar   := bar_index
+        lastBosGrade := gDn
+        lastBosNote  := noteOf(-1)
+        if showBos and (not bosOnlyOk or okDn)
+            label.new(bar_index, high, "BOS↓ " + gDn + "\n" + noteOf(-1), style = label.style_label_down, yloc = yloc.abovebar, color = gradeColor(gDn), textcolor = color.black, size = size.small, text_formatting = text.format_bold)
+        alert(syminfo.ticker + " 5分足 BOS↓ " + gDn + "（" + noteOf(-1) + "）※売買サインではありません", alert.freq_once_per_bar_close)
+
 // ───────────────────────── 描画 ─────────────────────────
 color cUp   = color.new(color.teal, 0)
 color cDn   = color.new(color.red, 0)
 color cFlat = color.new(color.gray, 0)
 color vwapColor = slopeDir == 1 ? cUp : slopeDir == -1 ? cDn : cFlat
-plot(showVwap and not newSession ? vwapVal : na, "Session VWAP", color = vwapColor, linewidth = 2, style = plot.style_linebr)
+plot(showVwap and not newSession ? vwapVal : na, "VWAP（今日の平均値段）", color = vwapColor, linewidth = 2, style = plot.style_linebr)
 
-plotshape(showMarks and chgLong,  "LONG候補へ変化",  shape.triangleup,   location.bottom, cUp,   size = size.tiny)
-plotshape(showMarks and chgShort, "SHORT候補へ変化", shape.triangledown, location.bottom, cDn,   size = size.tiny)
-plotshape(showMarks and chgWait,  "WAITへ変化",      shape.circle,       location.bottom, cFlat, size = size.tiny)
+plotshape(showMarks and chgLong,  "買い向きへ変化", shape.triangleup,   location.bottom, cUp,   size = size.tiny)
+plotshape(showMarks and chgShort, "売り向きへ変化", shape.triangledown, location.bottom, cDn,   size = size.tiny)
+plotshape(showMarks and chgWait,  "様子見へ変化",   shape.circle,       location.bottom, cFlat, size = size.tiny)
 
 bgcolor(showBg and barstate.isconfirmed ? (state == 1 ? color.new(color.teal, 93) : state == -1 ? color.new(color.red, 93) : na) : na, title = "状態背景")
 
-// データウィンドウ出力（他スクリプトから input.source で参照・検証用）
+// データウィンドウ出力（検証用）
 plot(state,    "環境状態 (+1/-1/0/2)", display = display.data_window)
-plot(atrPct,   "ATRパーセンタイル",     display = display.data_window)
+plot(atrPct,   "値動きの順位 %ile",     display = display.data_window)
 plot(bodyATR,  "直近足 実体/ATR",       display = display.data_window)
-plot(distATR,  "VWAP乖離 (ATR比)",      display = display.data_window)
+plot(distATR,  "VWAPからの離れ (ATR比)", display = display.data_window)
 plot(slopeATR, "VWAP傾き (ATR比)",      display = display.data_window)
+plot(bosUp and barstate.isconfirmed ? 1 : bosDn and barstate.isconfirmed ? -1 : 0, "BOS (+1/-1/0)", display = display.data_window)
 
 // ───────────────────────── アラート（確定足のみ） ─────────────────────────
-alertcondition(chgLong,  "TFX-4th: LONG候補（環境）に変化",  "{{ticker}} 5m: 第4判断がLONG候補（環境）に変化。既存3根拠のシグナルではありません。")
-alertcondition(chgShort, "TFX-4th: SHORT候補（環境）に変化", "{{ticker}} 5m: 第4判断がSHORT候補（環境）に変化。既存3根拠のシグナルではありません。")
-alertcondition(chgWait,  "TFX-4th: WAITに変化",              "{{ticker}} 5m: 第4判断がWAITに変化。")
-alertcondition(newShock, "TFX-4th: 急変動足を検出",          "{{ticker}} 5m: 急変動足（TRがATR倍率を超過）。エントリー警戒。")
+alertcondition(chgLong,  "TFX-4th: 買い向きに変化",  "{{ticker}} 5分足: 第4判断が『買い向き』に変化。売買サインではありません。")
+alertcondition(chgShort, "TFX-4th: 売り向きに変化",  "{{ticker}} 5分足: 第4判断が『売り向き』に変化。売買サインではありません。")
+alertcondition(chgWait,  "TFX-4th: 様子見に変化",    "{{ticker}} 5分足: 第4判断が『様子見』に変化。")
+alertcondition(newShock, "TFX-4th: 急変動足を検出",  "{{ticker}} 5分足: 急に大きく動いた足が出ました。少し待つのがおすすめです。")
+alertcondition(barstate.isconfirmed and bosUp and okUp, "TFX-4th: BOS↑（環境一致 ◎○）", "{{ticker}} 5分足: BOS↑ 環境一致（◎○）。3つの根拠を確認してください。")
+alertcondition(barstate.isconfirmed and bosDn and okDn, "TFX-4th: BOS↓（環境一致 ◎○）", "{{ticker}} 5分足: BOS↓ 環境一致（◎○）。3つの根拠を確認してください。")
 
 // ───────────────────────── パネル ─────────────────────────
 // 未確定足ではひとつ前（確定足）の値を表示する
@@ -182,64 +274,66 @@ txtSize(string s) =>
 fmt(float x) =>
     na(x) ? "-" : str.tostring(x, "#.##")
 
-mark(bool ok) =>
-    ok ? "✓" : "✗"
+// 1本あたりの値動きを、銘柄に合わせた言葉で表す（XAUUSD：ドルとpips／それ以外：ポイント）
+bool isXAU = str.contains(syminfo.ticker, "XAU")
+moveText(float a) =>
+    na(a) ? "-" : isXAU ? "1本で約" + str.tostring(a, "#.#") + "ドル（約" + str.tostring(a * 10, "#") + "pips）" : "1本で約" + str.tostring(a, "#.#") + "ポイント"
 
-var table panel = table.new(pnlPos(panelPos), 2, 10, bgcolor = color.new(color.black, 25), border_color = color.new(color.gray, 60), border_width = 1)
+var table panel = table.new(pnlPos(panelPos), 2, 12, bgcolor = color.new(color.black, 25), border_color = color.new(color.gray, 60), border_width = 1)
 
-if barstate.islast and showPanel
-    table.clear(panel, 0, 0, 1, 9)
-    ts       = txtSize(panelSize)
-    cTxt     = color.white
-    cOk      = color.new(color.lime, 0)
-    cNg      = color.new(color.orange, 0)
+if barstate.islast and viewMode != "非表示"
+    table.clear(panel, 0, 0, 1, 11)
+    ts   = txtSize(panelSize)
+    cTxt = color.white
+    cOk  = color.new(color.lime, 0)
+    cNg  = color.new(color.orange, 0)
 
-    int    s  = state[off]
-    string rs = reason[off]
-    string stTxt = s == 1 ? "LONG候補（環境）" : s == -1 ? "SHORT候補（環境）" : s == 2 ? "環境OK" : "WAIT"
+    int    s     = state[off]
+    string stTxt = s == 1 ? "🟢 買い向き" : s == -1 ? "🔴 売り向き" : s == 2 ? "🔵 環境OK" : "⚪ 様子見"
     color  stBg  = s == 1 ? color.new(color.teal, 20) : s == -1 ? color.new(color.red, 20) : s == 2 ? color.new(color.blue, 30) : color.new(color.gray, 30)
 
-    table.cell(panel, 0, 0, "第4判断（環境）", text_color = cTxt, text_size = ts, text_halign = text.align_left)
-    table.cell(panel, 1, 0, "※既存シグナルではない", text_color = color.new(color.silver, 0), text_size = ts, text_halign = text.align_right)
-    table.cell(panel, 0, 1, stTxt, text_color = cTxt, bgcolor = stBg, text_size = ts, text_halign = text.align_left)
-    table.cell(panel, 1, 1, rs, text_color = cTxt, bgcolor = stBg, text_size = ts, text_halign = text.align_left)
+    // 値動き
+    float  a     = atr[off]
+    string vWord = not volReady[off] ? "準備中" : shockAct[off] ? "急変動の直後" : volHigh[off] ? "荒い" : volLow[off] ? "小さい" : "普通"
+    bool   vOk   = volOK[off]
 
-    if showDetail
-        // ATR
-        bool   vOk  = volOK[off]
-        string vTxt = not volReady[off] ? "計算中" : shockAct[off] ? "急変動直後" : volHigh[off] ? "高ボラ" : volLow[off] ? "低ボラ" : "通常"
-        table.cell(panel, 0, 2, "ボラ(ATR) " + mark(vOk), text_color = vOk ? cOk : cNg, text_size = ts, text_halign = text.align_left)
-        table.cell(panel, 1, 2, vTxt + "（" + fmt(atrPct[off]) + "%ile）" + (useVol ? "" : " ※判定OFF"), text_color = cTxt, text_size = ts, text_halign = text.align_left)
+    // 直近のBOS
+    string bosTxt = lastBosDir == 0 ? "まだなし" : (lastBosDir == 1 ? "↑ " : "↓ ") + str.tostring(bar_index - off - lastBosBar) + "本前 " + lastBosGrade + " " + lastBosNote
+    color  bosCol = lastBosDir == 0 ? cTxt : gradeColor(lastBosGrade)
 
-        float a = atr[off]
-        string slTxt = ""
+    table.cell(panel, 0, 0, "第4判断", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 1, 0, "※売買サインではありません", text_color = color.new(color.silver, 0), text_size = ts, text_halign = text.align_right)
+    table.cell(panel, 0, 1, stTxt, text_color = cTxt, bgcolor = stBg, text_size = ts, text_halign = text.align_left, text_formatting = text.format_bold)
+    table.cell(panel, 1, 1, why[off], text_color = cTxt, bgcolor = stBg, text_size = ts, text_halign = text.align_left, text_formatting = text.format_bold)
+    table.cell(panel, 0, 2, "値動き", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 1, 2, vWord + "（" + moveText(a) + "）", text_color = vOk ? cTxt : cNg, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 0, 3, "直近BOS", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+    table.cell(panel, 1, 3, bosTxt, text_color = bosCol, text_size = ts, text_halign = text.align_left, text_formatting = text.format_bold)
+
+    if viewMode == "くわしく（数字あり）"
+        table.cell(panel, 0, 4, "値動きの順位", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+        table.cell(panel, 1, 4, fmt(atrPct[off]) + " %ile（15〜95が普通）" + (useVol ? "" : " ※判定OFF"), text_color = vOk ? cOk : cNg, text_size = ts, text_halign = text.align_left)
+
         if plannedSL > 0 and not na(a) and a > 0
             float r = plannedSL / a
-            slTxt := " / 想定SL " + fmt(r) + "ATR" + (r < 0.5 ? "（ノイズ内の恐れ）" : r > 2.0 ? "（広め）" : "")
-        table.cell(panel, 0, 3, "1 ATR", text_color = cTxt, text_size = ts, text_halign = text.align_left)
-        table.cell(panel, 1, 3, (na(a) ? "-" : str.tostring(a, format.mintick)) + slTxt, text_color = cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 0, 5, "想定損切り", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 1, 5, fmt(r) + " ATR" + (r < 0.5 ? "（狭い：刈られやすい）" : r > 2.0 ? "（広め）" : "（標準）"), text_color = r < 0.5 ? cNg : cTxt, text_size = ts, text_halign = text.align_left)
 
-        float b    = bodyATR[off]
-        bool  bUp  = close[off] >= open[off]
-        table.cell(panel, 0, 4, "直近確定足", text_color = cTxt, text_size = ts, text_halign = text.align_left)
-        table.cell(panel, 1, 4, (bUp ? "陽線" : "陰線") + " 実体 " + fmt(b) + "ATR" + (strong[off] ? "（強い）" : "（弱い）"), text_color = strong[off] ? cOk : cTxt, text_size = ts, text_halign = text.align_left)
+        float b = bodyATR[off]
+        table.cell(panel, 0, 6, "最後の足の勢い", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+        table.cell(panel, 1, 6, fmt(b) + " ATR" + (strong[off] ? "（強い）" : not na(b) and b < 0.3 ? "（迷い）" : "（普通）"), text_color = strong[off] ? cOk : cTxt, text_size = ts, text_halign = text.align_left)
 
-        // VWAP
-        if not hasVolume[off]
-            table.cell(panel, 0, 5, "VWAP", text_color = cNg, text_size = ts, text_halign = text.align_left)
-            table.cell(panel, 1, 5, "出来高データなし", text_color = cNg, text_size = ts, text_halign = text.align_left)
+        if hasVolume[off]
+            int  p    = posDir[off]
+            int  sl   = slopeDir[off]
+            bool judg = vwapJudge[off]
+            bool st   = stretched[off]
+            string pTxt = not judg ? "作成中" : p == 1 ? "上" : p == -1 ? "下" : "近く"
+            string sTxt = not judg ? "作成中" : sl == 1 ? "上向き" : sl == -1 ? "下向き" : "横ばい"
+            table.cell(panel, 0, 7, "平均線との位置", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 1, 7, pTxt + "（" + fmt(distATR[off]) + " ATR）" + (st ? " 伸び切り" : ""), text_color = st ? cNg : p == 1 ? cUp : p == -1 ? cDn : cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 0, 8, "平均線の傾き", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 1, 8, sTxt + "（" + fmt(slopeATR[off]) + "）", text_color = sl == 1 ? cUp : sl == -1 ? cDn : cTxt, text_size = ts, text_halign = text.align_left)
         else
-            int    p    = posDir[off]
-            int    sl   = slopeDir[off]
-            bool   judg = vwapJudge[off]
-            string pTxt = not judg ? "形成中" : p == 1 ? "上側" : p == -1 ? "下側" : "付近"
-            string sTxt = not judg ? "形成中" : sl == 1 ? "上向き" : sl == -1 ? "下向き" : "横ばい"
-            table.cell(panel, 0, 5, "VWAP位置", text_color = cTxt, text_size = ts, text_halign = text.align_left)
-            table.cell(panel, 1, 5, pTxt + "（" + fmt(distATR[off]) + "ATR）" + (useVwap ? "" : " ※判定OFF"), text_color = p == 1 ? cUp : p == -1 ? cDn : cTxt, text_size = ts, text_halign = text.align_left)
-            table.cell(panel, 0, 6, "VWAP傾き", text_color = cTxt, text_size = ts, text_halign = text.align_left)
-            table.cell(panel, 1, 6, sTxt + "（" + fmt(slopeATR[off]) + "ATR/" + str.tostring(slopeLen) + "本）", text_color = sl == 1 ? cUp : sl == -1 ? cDn : cTxt, text_size = ts, text_halign = text.align_left)
-            bool st = stretched[off]
-            table.cell(panel, 0, 7, "VWAP乖離", text_color = cTxt, text_size = ts, text_halign = text.align_left)
-            table.cell(panel, 1, 7, st ? "伸び切り警戒" : "通常範囲", text_color = st ? cNg : cTxt, text_size = ts, text_halign = text.align_left)
-            table.cell(panel, 0, 8, "セッション", text_color = cTxt, text_size = ts, text_halign = text.align_left)
-            table.cell(panel, 1, 8, str.tostring(sessBars[off] + 1) + "本目（" + (anchorMode == "指定時刻" ? str.format("{0,number,00}:{1,number,00} {2}", anchorHour, anchorMin, anchorTz) : "日足区切り") + "）", text_color = cTxt, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 0, 7, "平均線", text_color = cNg, text_size = ts, text_halign = text.align_left)
+            table.cell(panel, 1, 7, "出来高データなし", text_color = cNg, text_size = ts, text_halign = text.align_left)
